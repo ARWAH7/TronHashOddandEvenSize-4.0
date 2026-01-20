@@ -4,7 +4,8 @@ import { BlockData, IntervalRule } from '../types';
 import { 
   Gamepad2, Wallet, TrendingUp, History, CheckCircle2, XCircle, 
   Trash2, Clock, Settings2, PlayCircle, StopCircle, RefreshCw, 
-  ChevronDown, ChevronUp, AlertTriangle, Target, ArrowRight, Percent, BarChart4
+  ChevronDown, ChevronUp, AlertTriangle, Target, ArrowRight, Percent, BarChart4,
+  Plus, Layers, Activity, PauseCircle, Power
 } from 'lucide-react';
 
 interface SimulatedBettingProps {
@@ -16,11 +17,13 @@ interface SimulatedBettingProps {
 
 type BetType = 'PARITY' | 'SIZE';
 type BetTarget = 'ODD' | 'EVEN' | 'BIG' | 'SMALL';
-type StrategyType = 'MANUAL' | 'MARTINGALE' | 'DALEMBERT' | 'FLAT' | 'FIBONACCI' | 'PAROLI' | '1326';
+type StrategyType = 'MANUAL' | 'MARTINGALE' | 'DALEMBERT' | 'FLAT' | 'FIBONACCI' | 'PAROLI' | '1326' | 'CUSTOM';
 type AutoTargetMode = 'FIXED_ODD' | 'FIXED_EVEN' | 'FIXED_BIG' | 'FIXED_SMALL' | 'FOLLOW_LAST' | 'REVERSE_LAST';
 
 interface BetRecord {
   id: string;
+  taskId?: string; // ID of the auto-task (if auto)
+  taskName?: string; // Name of the auto-task
   timestamp: number;
   ruleId: string;
   ruleName: string;
@@ -47,15 +50,35 @@ interface SimConfig {
 interface StrategyConfig {
   type: StrategyType;
   autoTarget: AutoTargetMode;
+  targetType: 'PARITY' | 'SIZE';
   multiplier: number;
+  maxCycle: number;
   step: number;
   minStreak: number;
+  customSequence?: number[]; // Added for Custom Strategy
 }
 
 interface StrategyState {
   consecutiveLosses: number;
   currentBetAmount: number;
-  sequenceIndex: number; // For sequence based strategies (Fibonacci, 1-3-2-6)
+  sequenceIndex: number;
+}
+
+// NEW: Interface for a single auto-betting task
+interface AutoTask {
+  id: string;
+  name: string;
+  createTime: number;
+  ruleId: string; // The rule this task follows (e.g., 3s, 6s)
+  config: StrategyConfig; // Snapshot of strategy config
+  baseBet: number; // Snapshot of base bet
+  state: StrategyState; // Runtime state (martingale progress, etc.)
+  isActive: boolean;
+  stats: {
+    wins: number;
+    losses: number;
+    profit: number;
+  };
 }
 
 // ---------------------- CONSTANTS & HELPERS ----------------------
@@ -63,11 +86,12 @@ interface StrategyState {
 const STRATEGY_LABELS: Record<string, string> = {
   'MANUAL': '手动下注',
   'FLAT': '平注策略',
-  'MARTINGALE': '马丁格尔 (倍投)',
-  'DALEMBERT': '达朗贝尔 (升降)',
-  'FIBONACCI': '斐波那契 (数列)',
-  'PAROLI': '帕罗利 (反倍投)',
-  '1326': '1-3-2-6 法则'
+  'MARTINGALE': '马丁格尔',
+  'DALEMBERT': '达朗贝尔',
+  'FIBONACCI': '斐波那契',
+  'PAROLI': '帕罗利',
+  '1326': '1-3-2-6',
+  'CUSTOM': '自定义倍投'
 };
 
 const FIB_SEQ = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610];
@@ -116,97 +140,81 @@ const BalanceChart = ({ data, width, height }: { data: number[], width: number, 
 // ---------------------- MAIN COMPONENT ----------------------
 
 const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules }) => {
-  // --- STATE ---
-  const [balance, setBalance] = useState<number>(10000);
-  const [bets, setBets] = useState<BetRecord[]>([]);
   
-  const [config, setConfig] = useState<SimConfig>({
-    initialBalance: 10000,
-    odds: 1.98,
-    stopLoss: 0,
-    takeProfit: 0,
-    baseBet: 100
-  });
-
-  const [strategyConfig, setStrategyConfig] = useState<StrategyConfig>({
-    type: 'FLAT',
-    autoTarget: 'FIXED_ODD',
-    multiplier: 2.0,
-    step: 10,
-    minStreak: 1
-  });
-
-  // NEW: Initialize from localStorage to persist auto-betting state across tabs
-  const [isAutoRunning, setIsAutoRunning] = useState<boolean>(() => {
+  // 1. GLOBAL BALANCE & BETS
+  const [balance, setBalance] = useState<number>(() => {
+    if (typeof window === 'undefined') return 10000;
     try {
-      return localStorage.getItem('sim_v2_is_auto') === 'true';
-    } catch { return false; }
+      const saved = localStorage.getItem('sim_v3_balance');
+      return saved ? parseFloat(saved) : 10000;
+    } catch { return 10000; }
   });
 
-  // NEW: Initialize strategy state from localStorage to prevent martingale reset on tab switch
-  const [strategyState, setStrategyState] = useState<StrategyState>(() => {
+  const [bets, setBets] = useState<BetRecord[]>(() => {
+    if (typeof window === 'undefined') return [];
     try {
-      const saved = localStorage.getItem('sim_v2_strat_state');
-      if (saved) return JSON.parse(saved);
-    } catch {}
-    return {
-      consecutiveLosses: 0,
-      currentBetAmount: 100,
-      sequenceIndex: 0
+      const saved = localStorage.getItem('sim_v3_bets');
+      return saved ? JSON.parse(saved) : [];
+    } catch { return []; }
+  });
+  
+  const [config, setConfig] = useState<SimConfig>(() => {
+    const defaults = {
+      initialBalance: 10000,
+      odds: 1.98,
+      stopLoss: 0,
+      takeProfit: 0,
+      baseBet: 100
     };
+    if (typeof window === 'undefined') return defaults;
+    try {
+      const saved = localStorage.getItem('sim_v3_config');
+      return saved ? JSON.parse(saved) : defaults;
+    } catch { return defaults; }
   });
 
-  const [activeRuleId, setActiveRuleId] = useState<string>(rules[0]?.id || '');
-  const [showConfig, setShowConfig] = useState(false);
+  // 2. MULTI-TASK STATE
+  const [tasks, setTasks] = useState<AutoTask[]>(() => {
+    if (typeof window === 'undefined') return [];
+    try {
+      const saved = localStorage.getItem('sim_v3_tasks');
+      return saved ? JSON.parse(saved) : [];
+    } catch { return []; }
+  });
+
+  // 3. DRAFT CONFIG (For creating new tasks)
+  const [draftName, setDraftName] = useState('我的托管策略');
+  const [draftRuleId, setDraftRuleId] = useState<string>(rules[0]?.id || '');
+  const [draftConfig, setDraftConfig] = useState<StrategyConfig>({
+      type: 'FLAT',
+      autoTarget: 'FIXED_ODD',
+      targetType: 'PARITY',
+      multiplier: 2.0,
+      maxCycle: 10,
+      step: 10,
+      minStreak: 1,
+      customSequence: [1, 2, 4, 8, 17] // Default custom sequence
+  });
+  const [customSeqText, setCustomSeqText] = useState('1, 2, 4, 8, 17');
+
+  const [activeManualRuleId, setActiveManualRuleId] = useState<string>(rules[0]?.id || '');
+  const [showConfig, setShowConfig] = useState(true);
 
   // Derived Values
-  const activeRule = useMemo(() => rules.find(r => r.id === activeRuleId) || rules[0], [rules, activeRuleId]);
+  const manualRule = useMemo(() => rules.find(r => r.id === activeManualRuleId) || rules[0], [rules, activeManualRuleId]);
   const balanceHistory = useMemo(() => [config.initialBalance, ...bets.filter(b => b.status !== 'PENDING').slice().reverse().map(b => b.balanceAfter)], [config.initialBalance, bets]);
   const pendingBets = useMemo(() => bets.filter(b => b.status === 'PENDING'), [bets]);
   const settledBets = useMemo(() => bets.filter(b => b.status !== 'PENDING'), [bets]);
 
-  // Load Data (Balance, Bets, Config)
+  // Persist Data
   useEffect(() => {
-    try {
-      const savedBalance = localStorage.getItem('sim_v2_balance');
-      const savedBets = localStorage.getItem('sim_v2_bets');
-      const savedConfig = localStorage.getItem('sim_v2_config');
-      const savedStratConfig = localStorage.getItem('sim_v2_strat_config');
+    localStorage.setItem('sim_v3_balance', balance.toString());
+    localStorage.setItem('sim_v3_bets', JSON.stringify(bets));
+    localStorage.setItem('sim_v3_config', JSON.stringify(config));
+    localStorage.setItem('sim_v3_tasks', JSON.stringify(tasks));
+  }, [balance, bets, config, tasks]);
 
-      if (savedBalance) setBalance(parseFloat(savedBalance));
-      if (savedBets) setBets(JSON.parse(savedBets));
-      if (savedConfig) setConfig(JSON.parse(savedConfig));
-      if (savedStratConfig) setStrategyConfig(JSON.parse(savedStratConfig));
-      
-      // Note: isAutoRunning and strategyState are loaded in useState initializer
-    } catch(e) { console.error("Load failed", e); }
-  }, []);
-
-  // Save Data
-  useEffect(() => {
-    localStorage.setItem('sim_v2_balance', balance.toString());
-    localStorage.setItem('sim_v2_bets', JSON.stringify(bets));
-    localStorage.setItem('sim_v2_config', JSON.stringify(config));
-    localStorage.setItem('sim_v2_strat_config', JSON.stringify(strategyConfig));
-    // Persist running state and execution state
-    localStorage.setItem('sim_v2_is_auto', isAutoRunning.toString());
-    localStorage.setItem('sim_v2_strat_state', JSON.stringify(strategyState));
-  }, [balance, bets, config, strategyConfig, isAutoRunning, strategyState]);
-
-  // Sync Base Bet (Only if NOT running, to avoid resetting amount during auto run)
-  useEffect(() => {
-    if (!isAutoRunning) {
-      setStrategyState(prev => ({ 
-        ...prev, 
-        currentBetAmount: config.baseBet,
-        // Don't reset sequence index here necessarily, but usually safer to:
-        sequenceIndex: 0,
-        consecutiveLosses: 0
-      }));
-    }
-  }, [config.baseBet, isAutoRunning]);
-
-  // --- LOGIC ---
+  // --- LOGIC HELPERS ---
 
   const checkRuleAlignment = useCallback((height: number, rule: IntervalRule) => {
     if (rule.value <= 1) return true;
@@ -226,29 +234,32 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
     return { val: firstVal, count };
   }, []);
 
-  // --- ACTIONS ---
+  // --- CORE ACTIONS ---
 
   const placeBet = useCallback((
     targetHeight: number, 
     type: BetType, 
     target: BetTarget, 
     amount: number, 
-    isAuto: boolean,
-    currentBal: number
+    source: 'MANUAL' | 'AUTO',
+    rule: IntervalRule,
+    taskId?: string,
+    taskName?: string,
+    strategyType?: string
   ) => {
-    if (currentBal < amount) {
-      if (isAuto) setIsAutoRunning(false); 
-      else alert("余额不足！");
-      return false;
-    }
-
-    if (bets.some(b => b.targetHeight === targetHeight && b.ruleId === activeRule.id)) return false;
+    const isDuplicate = bets.some(b => 
+      b.targetHeight === targetHeight && 
+      b.ruleId === rule.id && 
+      (source === 'MANUAL' ? !b.taskId : b.taskId === taskId)
+    );
+    
+    if (isDuplicate) return false;
 
     const newBet: BetRecord = {
       id: Date.now().toString() + Math.random().toString().slice(2, 6),
       timestamp: Date.now(),
-      ruleId: activeRule.id,
-      ruleName: activeRule.label,
+      ruleId: rule.id,
+      ruleName: rule.label,
       targetHeight,
       betType: type,
       prediction: target,
@@ -256,78 +267,100 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
       odds: config.odds,
       status: 'PENDING',
       payout: 0,
-      strategyLabel: isAuto ? (strategyConfig.type === 'MANUAL' ? 'FLAT' : strategyConfig.type) : 'MANUAL',
-      balanceAfter: currentBal 
+      strategyLabel: strategyType || 'MANUAL',
+      balanceAfter: 0, // Calculated on settlement
+      taskId,
+      taskName
     };
 
     setBalance(prev => prev - amount);
     setBets(prev => [newBet, ...prev]);
     return true;
-  }, [activeRule, config.odds, strategyConfig.type, bets]);
+  }, [bets, config.odds]);
 
-  const resetAccount = (e?: React.MouseEvent) => {
+  const createTask = () => {
+    const newTask: AutoTask = {
+      id: Date.now().toString(),
+      name: draftName || `托管任务 ${tasks.length + 1}`,
+      createTime: Date.now(),
+      ruleId: draftRuleId,
+      config: { ...draftConfig },
+      baseBet: config.baseBet,
+      state: {
+        consecutiveLosses: 0,
+        currentBetAmount: draftConfig.type === 'CUSTOM' && draftConfig.customSequence ? config.baseBet * draftConfig.customSequence[0] : config.baseBet,
+        sequenceIndex: 0
+      },
+      isActive: false, // Default to paused
+      stats: { wins: 0, losses: 0, profit: 0 }
+    };
+    setTasks(prev => [...prev, newTask]);
+    // Reset draft name
+    setDraftName(`托管任务 ${tasks.length + 2}`);
+  };
+
+  const toggleTask = (taskId: string) => {
+    setTasks(prev => prev.map(t => t.id === taskId ? { ...t, isActive: !t.isActive } : t));
+  };
+
+  const startAllTasks = useCallback(() => {
+    setTasks(prev => prev.map(t => ({ ...t, isActive: true })));
+  }, []);
+
+  const stopAllTasks = useCallback(() => {
+    setTasks(prev => prev.map(t => ({ ...t, isActive: false })));
+  }, []);
+
+  const deleteTask = (taskId: string) => {
+    setTasks(prev => prev.filter(t => t.id !== taskId));
+  };
+
+  // Fixed Reset Account: Immediate action, no confirmation dialog
+  const resetAccount = useCallback((e?: React.MouseEvent) => {
     if (e) {
-      e.preventDefault();
-      e.stopPropagation();
+       e.preventDefault();
+       e.stopPropagation();
     }
     
-    // Default Initial Balance
-    const defaultBalance = 10000;
-    const defaultBaseBet = 100;
-
-    // 1. Force Clear Storage Immediately (Silent Mode)
-    localStorage.removeItem('sim_v2_bets');
-    localStorage.removeItem('sim_v2_strat_config');
-    localStorage.removeItem('sim_v2_strat_state');
-    localStorage.removeItem('sim_v2_is_auto');
-    localStorage.removeItem('sim_v2_config'); // Clear config to defaults
-    localStorage.setItem('sim_v2_balance', defaultBalance.toString());
-    
-    // 2. Reset State Immediately
-    setBalance(defaultBalance);
-    setBets([]);
-    setIsAutoRunning(false);
-    
-    // Reset Strategy State
-    setStrategyState({ 
-      consecutiveLosses: 0, 
-      currentBetAmount: defaultBaseBet, 
-      sequenceIndex: 0 
-    });
-    
-    // Reset Main Config
-    setConfig({
-      initialBalance: defaultBalance,
+    // Defaults
+    const defaults = {
+      initialBalance: 10000,
       odds: 1.98,
       stopLoss: 0,
       takeProfit: 0,
-      baseBet: defaultBaseBet
-    });
+      baseBet: 100
+    };
 
-    // Reset Strategy Config
-    setStrategyConfig({
-      type: 'FLAT',
-      autoTarget: 'FIXED_ODD',
-      multiplier: 2.0,
-      step: 10,
-      minStreak: 1
-    });
-  };
+    // 1. Reset States
+    setBalance(defaults.initialBalance);
+    setConfig(defaults);
+    setBets([]);
+    setTasks([]); 
+    
+    // 2. Clear Storage immediately
+    localStorage.setItem('sim_v3_balance', defaults.initialBalance.toString());
+    localStorage.setItem('sim_v3_bets', '[]');
+    localStorage.setItem('sim_v3_tasks', '[]');
+    localStorage.setItem('sim_v3_config', JSON.stringify(defaults));
+  }, []);
 
-  // --- AUTO ENGINE ---
+  // --- THE MULTI-THREAD ENGINE ---
   useEffect(() => {
     if (allBlocks.length === 0) return;
 
+    // We need to handle updates in a single pass to avoid race conditions with balance/bets
     let currentBalance = balance;
-    let balanceChanged = false;
-    let lastAutoResult: 'WIN' | 'LOSS' | null = null;
-
-    // 1. Settle Bets
+    let betsChanged = false;
+    let tasksChanged = false;
+    
+    const nextTasks = [...tasks]; // Clone for mutation
+    
+    // 1. SETTLE PENDING BETS & UPDATE TASK STATES
     const updatedBets = bets.map(bet => {
       if (bet.status === 'PENDING') {
         const targetBlock = allBlocks.find(b => b.height === bet.targetHeight);
         if (targetBlock) {
-          balanceChanged = true;
+          betsChanged = true;
           let isWin = false;
           let resultVal = '';
 
@@ -339,159 +372,213 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
             resultVal = targetBlock.sizeType === 'BIG' ? '大' : '小';
           }
 
-          if (bet.strategyLabel !== 'MANUAL') {
-             lastAutoResult = isWin ? 'WIN' : 'LOSS';
-          }
-
           const payout = isWin ? bet.amount * bet.odds : 0;
           if (isWin) currentBalance += payout;
           
+          // Identify which task owns this bet and update its state
+          if (bet.taskId) {
+            const taskIndex = nextTasks.findIndex(t => t.id === bet.taskId);
+            if (taskIndex !== -1) {
+              tasksChanged = true;
+              const task = nextTasks[taskIndex];
+              
+              // Update Stats
+              task.stats.wins += isWin ? 1 : 0;
+              task.stats.losses += isWin ? 0 : 1;
+              task.stats.profit += (isWin ? payout : 0) - bet.amount;
+
+              // Update Strategy State (Martingale, etc.)
+              let { currentBetAmount, consecutiveLosses, sequenceIndex } = task.state;
+              
+              switch (task.config.type) {
+                case 'MARTINGALE':
+                  if (!isWin) {
+                    const nextLosses = consecutiveLosses + 1;
+                    if (nextLosses >= task.config.maxCycle) {
+                      currentBetAmount = task.baseBet; // Reset
+                      consecutiveLosses = 0;
+                    } else {
+                      currentBetAmount *= task.config.multiplier;
+                      consecutiveLosses = nextLosses;
+                    }
+                  } else {
+                    currentBetAmount = task.baseBet;
+                    consecutiveLosses = 0;
+                  }
+                  break;
+                case 'DALEMBERT':
+                   if (!isWin) {
+                      currentBetAmount += task.config.step;
+                      consecutiveLosses++;
+                   } else {
+                      currentBetAmount -= task.config.step;
+                      if(currentBetAmount < task.baseBet) currentBetAmount = task.baseBet;
+                      consecutiveLosses = 0;
+                   }
+                   break;
+                case 'FIBONACCI':
+                   if (!isWin) {
+                      sequenceIndex = Math.min(sequenceIndex + 1, FIB_SEQ.length - 1);
+                   } else {
+                      sequenceIndex = Math.max(0, sequenceIndex - 2);
+                   }
+                   currentBetAmount = task.baseBet * FIB_SEQ[sequenceIndex];
+                   break;
+                case 'PAROLI':
+                   if(isWin) {
+                      sequenceIndex++;
+                      if(sequenceIndex >= 3) {
+                         sequenceIndex = 0;
+                         currentBetAmount = task.baseBet;
+                      } else {
+                         currentBetAmount *= 2;
+                      }
+                   } else {
+                      sequenceIndex = 0;
+                      currentBetAmount = task.baseBet;
+                   }
+                   break;
+                case '1326':
+                   if(isWin) {
+                      sequenceIndex++;
+                      if(sequenceIndex >= SEQ_1326.length) {
+                         sequenceIndex = 0;
+                         currentBetAmount = task.baseBet;
+                      } else {
+                         currentBetAmount = task.baseBet * SEQ_1326[sequenceIndex];
+                      }
+                   } else {
+                      sequenceIndex = 0;
+                      currentBetAmount = task.baseBet;
+                   }
+                   break;
+                case 'CUSTOM':
+                    const cSeq = task.config.customSequence || [1];
+                    if (!isWin) {
+                       // Loss: move to next multiplier
+                       if (sequenceIndex + 1 >= cSeq.length) {
+                          sequenceIndex = 0; // End of sequence, reset
+                       } else {
+                          sequenceIndex++;
+                       }
+                    } else {
+                       // Win: reset to start
+                       sequenceIndex = 0;
+                    }
+                    currentBetAmount = task.baseBet * cSeq[sequenceIndex];
+                    break;
+                default:
+                   currentBetAmount = task.baseBet;
+              }
+
+              // Apply State
+              task.state = { currentBetAmount: Math.floor(currentBetAmount), consecutiveLosses, sequenceIndex };
+            }
+          }
+
           return { ...bet, status: isWin ? 'WIN' : 'LOSS', payout, resultVal, balanceAfter: currentBalance } as BetRecord;
         }
       }
       return bet;
     });
 
-    if (balanceChanged) {
-      setBets(updatedBets);
-      setBalance(currentBalance);
-    }
+    // 2. PROCESS ACTIVE TASKS (PLACE NEW BETS)
+    const finalBets = [...updatedBets];
+    
+    // Check stop loss/take profit globally? Or per task? 
+    // Usually global balance check for protection
+    const profit = currentBalance - config.initialBalance;
+    const globalStop = (config.takeProfit > 0 && profit >= config.takeProfit) || (config.stopLoss > 0 && profit <= -config.stopLoss);
 
-    // 2. Strategy Calculation (The Brain)
-    // CRITICAL FIX: Use local variables to track next state within this cycle
-    // React state updates are async, so we need to calculate the value to use *immediately* for the next bet.
-    let nextBetAmount = strategyState.currentBetAmount;
-    let nextSequenceIndex = strategyState.sequenceIndex;
-    let nextConsecutiveLosses = strategyState.consecutiveLosses;
-
-    if (lastAutoResult) {
-       // Ensure index exists
-       if (typeof nextSequenceIndex === 'undefined') nextSequenceIndex = 0;
-
-       switch (strategyConfig.type) {
-          case 'MARTINGALE':
-             if (lastAutoResult === 'LOSS') {
-                // Fix: Apply multiplier immediately
-                nextBetAmount = nextBetAmount * strategyConfig.multiplier;
-                nextConsecutiveLosses += 1;
-             } else {
-                nextBetAmount = config.baseBet;
-                nextConsecutiveLosses = 0;
-             }
-             break;
-
-          case 'DALEMBERT':
-             if (lastAutoResult === 'LOSS') {
-                nextBetAmount += strategyConfig.step;
-                nextConsecutiveLosses += 1;
-             } else {
-                nextBetAmount -= strategyConfig.step;
-                if (nextBetAmount < config.baseBet) nextBetAmount = config.baseBet;
-                nextConsecutiveLosses = 0;
-             }
-             break;
-
-          case 'FIBONACCI':
-             if (lastAutoResult === 'LOSS') {
-                nextSequenceIndex = Math.min(nextSequenceIndex + 1, FIB_SEQ.length - 1);
-             } else {
-                nextSequenceIndex = Math.max(0, nextSequenceIndex - 2);
-             }
-             nextBetAmount = config.baseBet * FIB_SEQ[nextSequenceIndex];
-             break;
-
-          case 'PAROLI':
-             if (lastAutoResult === 'WIN') {
-                nextSequenceIndex++;
-                if (nextSequenceIndex >= 3) {
-                   nextSequenceIndex = 0;
-                   nextBetAmount = config.baseBet;
-                } else {
-                   nextBetAmount *= 2;
-                }
-             } else {
-                nextSequenceIndex = 0;
-                nextBetAmount = config.baseBet;
-             }
-             break;
-
-          case '1326':
-             if (lastAutoResult === 'WIN') {
-                nextSequenceIndex++;
-                if (nextSequenceIndex >= SEQ_1326.length) {
-                   nextSequenceIndex = 0;
-                   nextBetAmount = config.baseBet;
-                } else {
-                   nextBetAmount = config.baseBet * SEQ_1326[nextSequenceIndex];
-                }
-             } else {
-                nextSequenceIndex = 0;
-                nextBetAmount = config.baseBet;
-             }
-             break;
-
-          case 'FLAT':
-          default:
-             nextBetAmount = config.baseBet;
-             break;
-       }
-
-       // Update the state for persistence and UI
-       setStrategyState({
-           currentBetAmount: nextBetAmount,
-           sequenceIndex: nextSequenceIndex,
-           consecutiveLosses: nextConsecutiveLosses
-       });
-    }
-
-    // 3. Auto Bet Trigger
-    if (isAutoRunning) {
-       const profit = currentBalance - config.initialBalance;
-       if ((config.takeProfit > 0 && profit >= config.takeProfit) || 
-           (config.stopLoss > 0 && profit <= -config.stopLoss)) {
-          setIsAutoRunning(false);
+    if (!globalStop) {
+      nextTasks.forEach(task => {
+        if (!task.isActive) return;
+        if (currentBalance < task.state.currentBetAmount) {
+          task.isActive = false; // Stop if bankrupt
+          tasksChanged = true;
           return;
-       }
+        }
 
-       const nextHeight = getNextTargetHeight(allBlocks[0].height, activeRule.value, activeRule.startBlock);
-       
-       if (updatedBets.some(b => b.targetHeight === nextHeight && b.ruleId === activeRule.id)) return;
+        const rule = rules.find(r => r.id === task.ruleId);
+        if (!rule) return;
 
-       const ruleBlocks = allBlocks.filter(b => checkRuleAlignment(b.height, activeRule));
-       
-       let type: BetType = 'PARITY';
-       let target: BetTarget = 'ODD';
-       let shouldBet = false;
-       
-       if (strategyConfig.autoTarget.includes('FIXED')) {
+        const nextHeight = getNextTargetHeight(allBlocks[0].height, rule.value, rule.startBlock);
+        
+        // Check if THIS task already bet on this height
+        if (finalBets.some(b => b.targetHeight === nextHeight && b.ruleId === rule.id && b.taskId === task.id)) return;
+
+        // Determine Bet
+        const ruleBlocks = allBlocks.filter(b => checkRuleAlignment(b.height, rule));
+        let type: BetType = 'PARITY';
+        let target: BetTarget = 'ODD';
+        let shouldBet = false;
+
+        if (task.config.autoTarget.includes('FIXED')) {
           shouldBet = true;
-          const t = strategyConfig.autoTarget.split('_')[1] as BetTarget;
+          const t = task.config.autoTarget.split('_')[1] as BetTarget;
           target = t;
           type = (t === 'ODD' || t === 'EVEN') ? 'PARITY' : 'SIZE';
-       } else if (ruleBlocks.length > 0) {
-          const streakP = calculateStreak(ruleBlocks, 'PARITY');
-          
-          if (strategyConfig.autoTarget === 'FOLLOW_LAST') {
-             if (streakP.count >= strategyConfig.minStreak) {
-                target = streakP.val as BetTarget;
+        } else if (ruleBlocks.length > 0) {
+           const targetType = task.config.targetType || 'PARITY';
+           const streak = calculateStreak(ruleBlocks, targetType);
+           type = targetType;
+           
+           if (task.config.autoTarget === 'FOLLOW_LAST') {
+             if (streak.count >= task.config.minStreak) {
+               target = streak.val as BetTarget;
+               shouldBet = true;
+             }
+           } else if (task.config.autoTarget === 'REVERSE_LAST') {
+             if (streak.count >= task.config.minStreak) {
+                if (targetType === 'PARITY') target = streak.val === 'ODD' ? 'EVEN' : 'ODD';
+                else target = streak.val === 'BIG' ? 'SMALL' : 'BIG';
                 shouldBet = true;
              }
-          } else if (strategyConfig.autoTarget === 'REVERSE_LAST') {
-             if (streakP.count >= strategyConfig.minStreak) {
-                target = streakP.val === 'ODD' ? 'EVEN' : 'ODD';
-                shouldBet = true;
-             }
-          }
-       }
+           }
+        }
 
-       if (shouldBet) {
-          // CRITICAL: Use the locally calculated nextBetAmount, not the state value which might be stale
-          placeBet(nextHeight, type, target, Math.floor(nextBetAmount), true, currentBalance);
+        if (shouldBet) {
+           const amount = Math.floor(task.state.currentBetAmount);
+           const newBet: BetRecord = {
+             id: Date.now().toString() + Math.random().toString().slice(2, 6) + task.id,
+             taskId: task.id,
+             taskName: task.name,
+             timestamp: Date.now(),
+             ruleId: rule.id,
+             ruleName: rule.label,
+             targetHeight: nextHeight,
+             betType: type,
+             prediction: target,
+             amount,
+             odds: config.odds,
+             status: 'PENDING',
+             payout: 0,
+             strategyLabel: task.config.type,
+             balanceAfter: 0
+           };
+           currentBalance -= amount;
+           finalBets.unshift(newBet); // Add to top
+           betsChanged = true;
+        }
+      });
+    } else {
+       // Stop all tasks if global stop hit
+       if (nextTasks.some(t => t.isActive)) {
+          nextTasks.forEach(t => t.isActive = false);
+          tasksChanged = true;
        }
     }
 
-  }, [allBlocks, activeRule, isAutoRunning, config, strategyConfig, placeBet, strategyState.currentBetAmount, calculateStreak, checkRuleAlignment]);
+    // 3. COMMIT UPDATES
+    if (betsChanged) {
+       setBets(finalBets);
+       setBalance(currentBalance);
+    }
+    if (tasksChanged) {
+       setTasks(nextTasks);
+    }
 
+  }, [allBlocks, rules, tasks, bets, config, checkRuleAlignment, calculateStreak, balance]);
 
   // Stats
   const stats = useMemo(() => {
@@ -504,7 +591,7 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
   }, [settledBets, balance, config.initialBalance]);
 
   return (
-    <div className="max-w-7xl mx-auto space-y-6 animate-in fade-in duration-500 pb-20">
+    <div className="max-w-[1600px] mx-auto space-y-6 animate-in fade-in duration-500 pb-20">
       
       {/* 1. TOP DASHBOARD */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
@@ -518,7 +605,7 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
             </div>
          </div>
          <div className="bg-white rounded-3xl p-6 shadow-sm border border-gray-100">
-            <span className="text-xs font-black text-gray-400 uppercase tracking-wider">胜率概览</span>
+            <span className="text-xs font-black text-gray-400 uppercase tracking-wider">总胜率概览</span>
             <div className="flex items-end space-x-2 mt-2">
                <span className="text-3xl font-black text-blue-600">{stats.winRate.toFixed(1)}%</span>
                <span className="text-xs text-gray-400 font-bold mb-1.5">{stats.wins}/{stats.total}</span>
@@ -528,32 +615,169 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
             </div>
          </div>
          <div className="md:col-span-2 bg-white rounded-3xl p-4 shadow-sm border border-gray-100 flex flex-col relative">
-            <span className="absolute top-4 left-4 text-[10px] font-black text-gray-400 uppercase tracking-wider z-10">盈亏曲线</span>
+            <span className="absolute top-4 left-4 text-[10px] font-black text-gray-400 uppercase tracking-wider z-10">总盈亏曲线</span>
             <div className="flex-1 pt-4 min-h-[80px]">
                <BalanceChart data={balanceHistory} width={400} height={80} />
             </div>
          </div>
       </div>
 
-      {/* 2. MAIN LAYOUT */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         
-        {/* LEFT: SETTINGS */}
-        <div className="space-y-6">
+        {/* LEFT: TASK CREATOR (4 cols) */}
+        <div className="lg:col-span-4 space-y-6">
            <div className="bg-white rounded-[2rem] p-6 shadow-xl border border-indigo-50">
               <div className="flex justify-between items-center mb-6">
                  <div className="flex items-center space-x-2">
-                    <Settings2 className="w-5 h-5 text-indigo-600" />
-                    <h3 className="font-black text-gray-900">参数配置</h3>
+                    <Layers className="w-5 h-5 text-indigo-600" />
+                    <h3 className="font-black text-gray-900">托管任务生成器</h3>
                  </div>
                  <button onClick={() => setShowConfig(!showConfig)} className="text-xs font-bold text-gray-400 hover:text-indigo-600 flex items-center">
                     {showConfig ? '收起' : '展开'} {showConfig ? <ChevronUp className="w-3 h-3 ml-1" /> : <ChevronDown className="w-3 h-3 ml-1" />}
                  </button>
               </div>
 
-              {/* General Config */}
               {showConfig && (
-                <div className="grid grid-cols-2 gap-3 mb-6 animate-in slide-in-from-top-2">
+                <div className="space-y-4 animate-in slide-in-from-top-2">
+                   
+                   {/* Task Name */}
+                   <div>
+                      <label className="text-[10px] font-black text-gray-400 uppercase ml-1">任务备注</label>
+                      <input 
+                        type="text" 
+                        value={draftName} 
+                        onChange={e => setDraftName(e.target.value)}
+                        placeholder="例如：3秒平注追单..."
+                        className="w-full mt-1 px-4 py-2.5 bg-gray-50 border-transparent focus:bg-white focus:border-indigo-500 border-2 rounded-xl text-xs font-bold outline-none transition-all"
+                      />
+                   </div>
+
+                   {/* Rule Selector */}
+                   <div className="bg-indigo-50/50 p-4 rounded-2xl border border-indigo-100/50">
+                      <label className="text-[10px] font-black text-gray-400 uppercase block mb-2">下注规则 (秒数)</label>
+                      <select 
+                        value={draftRuleId} 
+                        onChange={e => setDraftRuleId(e.target.value)}
+                        className="w-full bg-white text-indigo-900 rounded-xl px-3 py-2 text-xs font-black border border-indigo-100 outline-none cursor-pointer shadow-sm"
+                      >
+                         {rules.map(r => (
+                           <option key={r.id} value={r.id}>{r.label} (步长: {r.value})</option>
+                         ))}
+                      </select>
+                   </div>
+
+                   {/* Strategy Type */}
+                   <div>
+                      <label className="text-[10px] font-black text-gray-400 uppercase ml-1">资金策略</label>
+                      <select 
+                        value={draftConfig.type} 
+                        onChange={e => setDraftConfig({...draftConfig, type: e.target.value as StrategyType})}
+                        className="w-full bg-gray-50 text-gray-800 rounded-xl px-3 py-2.5 text-xs font-black border border-transparent focus:border-indigo-500 outline-none mt-1"
+                      >
+                         {Object.entries(STRATEGY_LABELS).filter(([k]) => k !== 'MANUAL').map(([k, v]) => (
+                            <option key={k} value={k}>{v}</option>
+                         ))}
+                      </select>
+                   </div>
+                   
+                   {/* Strategy Params */}
+                   {draftConfig.type === 'MARTINGALE' && (
+                      <div className="grid grid-cols-2 gap-2">
+                         <div className="bg-gray-50 px-3 py-2 rounded-xl">
+                            <span className="text-[10px] font-bold text-gray-400 block mb-1">倍投系数</span>
+                            <input type="number" step="0.1" value={draftConfig.multiplier} onChange={e => setDraftConfig({...draftConfig, multiplier: parseFloat(e.target.value)})} className="w-full bg-white rounded-lg px-2 py-1 text-xs font-black text-center" />
+                         </div>
+                         <div className="bg-gray-50 px-3 py-2 rounded-xl">
+                            <span className="text-[10px] font-bold text-gray-400 block mb-1">跟投期数</span>
+                            <input type="number" min="1" value={draftConfig.maxCycle} onChange={e => setDraftConfig({...draftConfig, maxCycle: parseInt(e.target.value) || 10})} className="w-full bg-white rounded-lg px-2 py-1 text-xs font-black text-center" />
+                         </div>
+                      </div>
+                   )}
+                   {draftConfig.type === 'DALEMBERT' && (
+                      <div className="bg-gray-50 px-3 py-2 rounded-xl flex justify-between items-center">
+                         <span className="text-[10px] font-bold text-gray-500">升降步长</span>
+                         <input type="number" value={draftConfig.step} onChange={e => setDraftConfig({...draftConfig, step: parseFloat(e.target.value)})} className="w-20 bg-white rounded-lg px-2 py-1 text-xs font-black text-center" />
+                      </div>
+                   )}
+                   {/* Custom Sequence Input */}
+                   {draftConfig.type === 'CUSTOM' && (
+                      <div className="bg-gray-50 px-3 py-2 rounded-xl">
+                        <span className="text-[10px] font-bold text-gray-400 block mb-1">自定义倍数序列 (逗号分隔)</span>
+                        <textarea 
+                          value={customSeqText} 
+                          onChange={e => {
+                            const txt = e.target.value;
+                            setCustomSeqText(txt);
+                            const seq = txt.split(/[,，\s]+/).map(s => parseFloat(s)).filter(n => !isNaN(n) && n > 0);
+                            setDraftConfig({...draftConfig, customSequence: seq.length > 0 ? seq : [1]});
+                          }} 
+                          className="w-full bg-white rounded-lg px-2 py-1.5 text-xs font-black border border-transparent focus:border-indigo-200 outline-none h-16 resize-none"
+                          placeholder="1, 2, 3, 5, 8..."
+                        />
+                      </div>
+                   )}
+
+                   {/* Target Mode */}
+                   <div>
+                      <label className="text-[10px] font-black text-gray-400 uppercase ml-1">自动目标</label>
+                      <div className="grid grid-cols-2 gap-2 mt-1">
+                         <button onClick={() => setDraftConfig({...draftConfig, autoTarget: 'FIXED_ODD'})} className={`py-2 rounded-lg text-[10px] font-bold border ${draftConfig.autoTarget === 'FIXED_ODD' ? 'bg-red-500 text-white border-red-500' : 'bg-white text-gray-400 border-gray-200'}`}>定买单</button>
+                         <button onClick={() => setDraftConfig({...draftConfig, autoTarget: 'FIXED_EVEN'})} className={`py-2 rounded-lg text-[10px] font-bold border ${draftConfig.autoTarget === 'FIXED_EVEN' ? 'bg-teal-500 text-white border-teal-500' : 'bg-white text-gray-400 border-gray-200'}`}>定买双</button>
+                         <button onClick={() => setDraftConfig({...draftConfig, autoTarget: 'FIXED_BIG'})} className={`py-2 rounded-lg text-[10px] font-bold border ${draftConfig.autoTarget === 'FIXED_BIG' ? 'bg-orange-500 text-white border-orange-500' : 'bg-white text-gray-400 border-gray-200'}`}>定买大</button>
+                         <button onClick={() => setDraftConfig({...draftConfig, autoTarget: 'FIXED_SMALL'})} className={`py-2 rounded-lg text-[10px] font-bold border ${draftConfig.autoTarget === 'FIXED_SMALL' ? 'bg-indigo-500 text-white border-indigo-500' : 'bg-white text-gray-400 border-gray-200'}`}>定买小</button>
+                         <button onClick={() => setDraftConfig({...draftConfig, autoTarget: 'FOLLOW_LAST'})} className={`py-2 rounded-lg text-[10px] font-bold border ${draftConfig.autoTarget === 'FOLLOW_LAST' ? 'bg-blue-500 text-white border-blue-500' : 'bg-white text-gray-400 border-gray-200'}`}>跟上期(顺)</button>
+                         <button onClick={() => setDraftConfig({...draftConfig, autoTarget: 'REVERSE_LAST'})} className={`py-2 rounded-lg text-[10px] font-bold border ${draftConfig.autoTarget === 'REVERSE_LAST' ? 'bg-purple-500 text-white border-purple-500' : 'bg-white text-gray-400 border-gray-200'}`}>反上期(砍)</button>
+                      </div>
+                   </div>
+
+                   {(draftConfig.autoTarget === 'FOLLOW_LAST' || draftConfig.autoTarget === 'REVERSE_LAST') && (
+                      <div className="bg-gray-50 p-3 rounded-xl border border-gray-100">
+                          <div className="flex gap-2 mb-3">
+                             <button 
+                                  onClick={() => setDraftConfig({...draftConfig, targetType: 'PARITY'})}
+                                  className={`flex-1 py-1.5 rounded-lg text-[10px] font-bold border ${draftConfig.targetType === 'PARITY' ? 'bg-white shadow text-indigo-600 border-indigo-200' : 'text-gray-400 border-transparent'}`}
+                             >
+                                  玩法：单双
+                             </button>
+                             <button 
+                                  onClick={() => setDraftConfig({...draftConfig, targetType: 'SIZE'})}
+                                  className={`flex-1 py-1.5 rounded-lg text-[10px] font-bold border ${draftConfig.targetType === 'SIZE' ? 'bg-white shadow text-indigo-600 border-indigo-200' : 'text-gray-400 border-transparent'}`}
+                             >
+                                  玩法：大小
+                             </button>
+                          </div>
+                          <div className="flex items-center justify-between">
+                              <span className="text-[10px] font-bold text-amber-600 flex items-center"><AlertTriangle className="w-3 h-3 mr-1" /> 起投连数</span>
+                              <input 
+                                  type="number" min="1" 
+                                  value={draftConfig.minStreak} 
+                                  onChange={e => setDraftConfig({...draftConfig, minStreak: Math.max(1, parseInt(e.target.value) || 1)})} 
+                                  className="w-16 text-center bg-white rounded-lg text-xs font-black border border-amber-200 text-amber-600" 
+                              />
+                          </div>
+                      </div>
+                   )}
+
+                   <div className="pt-4 border-t border-gray-100 mt-2">
+                      <div className="flex items-center justify-between mb-3">
+                         <span className="text-xs font-bold text-gray-500">基础注额 (每单)</span>
+                         <input type="number" value={config.baseBet} onChange={(e) => setConfig({...config, baseBet: parseFloat(e.target.value)})} className="w-20 text-right bg-gray-50 px-2 py-1 rounded-lg text-xs font-black" />
+                      </div>
+                      <button 
+                        onClick={createTask}
+                        className="w-full py-3.5 bg-indigo-600 text-white rounded-xl font-black text-sm flex items-center justify-center transition-all shadow-lg shadow-indigo-200 active:scale-95 hover:bg-indigo-700"
+                      >
+                        <Plus className="w-4 h-4 mr-2" /> 添加托管任务
+                      </button>
+                   </div>
+                </div>
+              )}
+           </div>
+
+           {/* Global Config Card */}
+           <div className="bg-white rounded-[2rem] p-6 shadow-sm border border-gray-100">
+              <h3 className="text-xs font-black text-gray-400 uppercase mb-4">全局风控参数</h3>
+              <div className="grid grid-cols-2 gap-3">
                    <div>
                      <label className="text-[10px] font-black text-gray-400 uppercase">初始本金</label>
                      <input type="number" value={config.initialBalance} onChange={e => setConfig({...config, initialBalance: parseFloat(e.target.value)})} className="w-full bg-gray-50 rounded-lg px-2 py-1.5 text-xs font-bold border border-transparent focus:border-indigo-500 outline-none" />
@@ -577,145 +801,117 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
                    >
                       <Trash2 className="w-3 h-3 mr-2" /> 重置所有数据
                    </button>
-                </div>
-              )}
-
-              {/* Strategy Form */}
-              <div className="space-y-4">
-                 <div className="bg-indigo-50/50 p-4 rounded-2xl border border-indigo-100/50">
-                    <label className="text-[10px] font-black text-gray-400 uppercase block mb-2">选择下注规则</label>
-                    <select 
-                      value={activeRuleId} 
-                      onChange={e => setActiveRuleId(e.target.value)}
-                      className="w-full bg-white text-indigo-900 rounded-xl px-3 py-2 text-xs font-black border border-indigo-100 outline-none cursor-pointer shadow-sm"
-                    >
-                       {rules.map(r => (
-                         <option key={r.id} value={r.id}>{r.label} (步长: {r.value})</option>
-                       ))}
-                    </select>
-                 </div>
-
-                 <div>
-                    <label className="text-[10px] font-black text-gray-400 uppercase ml-1">资金策略</label>
-                    <select 
-                      value={strategyConfig.type} 
-                      onChange={e => setStrategyConfig({...strategyConfig, type: e.target.value as StrategyType})}
-                      className="w-full bg-gray-50 text-gray-800 rounded-xl px-3 py-2.5 text-xs font-black border border-transparent focus:border-indigo-500 outline-none mt-1"
-                    >
-                       <option value="FLAT">平注 (Flat)</option>
-                       <option value="MARTINGALE">马丁格尔 (倍投)</option>
-                       <option value="DALEMBERT">达朗贝尔 (升降)</option>
-                       <option value="FIBONACCI">斐波那契 (数列)</option>
-                       <option value="PAROLI">帕罗利 (反倍投/胜进)</option>
-                       <option value="1326">1-3-2-6 法则</option>
-                    </select>
-                 </div>
-                 
-                 {strategyConfig.type === 'MARTINGALE' && (
-                    <div className="flex items-center justify-between bg-gray-50 px-3 py-2 rounded-xl">
-                       <span className="text-[10px] font-bold text-gray-500">倍投系数</span>
-                       <input type="number" step="0.1" value={strategyConfig.multiplier} onChange={e => setStrategyConfig({...strategyConfig, multiplier: parseFloat(e.target.value)})} className="w-16 text-center bg-white rounded-lg text-xs font-black" />
-                    </div>
-                 )}
-                 {strategyConfig.type === 'DALEMBERT' && (
-                    <div className="flex items-center justify-between bg-gray-50 px-3 py-2 rounded-xl">
-                       <span className="text-[10px] font-bold text-gray-500">升降步长</span>
-                       <input type="number" value={strategyConfig.step} onChange={e => setStrategyConfig({...strategyConfig, step: parseFloat(e.target.value)})} className="w-16 text-center bg-white rounded-lg text-xs font-black" />
-                    </div>
-                 )}
-                 {/* Descriptions for new strategies */}
-                 {strategyConfig.type === 'FIBONACCI' && (
-                    <div className="bg-amber-50 px-3 py-2 rounded-xl text-[10px] text-amber-700 font-medium">
-                       输则进1 (1,1,2,3,5...)，赢则退2。适合抗震荡。
-                    </div>
-                 )}
-                 {strategyConfig.type === 'PAROLI' && (
-                    <div className="bg-emerald-50 px-3 py-2 rounded-xl text-[10px] text-emerald-700 font-medium">
-                       赢则翻倍，3连胜或输则重置。以小博大。
-                    </div>
-                 )}
-                 {strategyConfig.type === '1326' && (
-                    <div className="bg-blue-50 px-3 py-2 rounded-xl text-[10px] text-blue-700 font-medium">
-                       赢则按 1-3-2-6 比例下注，输则重置。均衡策略。
-                    </div>
-                 )}
-
-
-                 <div>
-                    <label className="text-[10px] font-black text-gray-400 uppercase ml-1">自动目标</label>
-                    <div className="grid grid-cols-2 gap-2 mt-1">
-                       <button onClick={() => setStrategyConfig({...strategyConfig, autoTarget: 'FIXED_ODD'})} className={`py-2 rounded-lg text-[10px] font-bold border ${strategyConfig.autoTarget === 'FIXED_ODD' ? 'bg-red-500 text-white border-red-500' : 'bg-white text-gray-400 border-gray-200'}`}>定买单</button>
-                       <button onClick={() => setStrategyConfig({...strategyConfig, autoTarget: 'FIXED_EVEN'})} className={`py-2 rounded-lg text-[10px] font-bold border ${strategyConfig.autoTarget === 'FIXED_EVEN' ? 'bg-teal-500 text-white border-teal-500' : 'bg-white text-gray-400 border-gray-200'}`}>定买双</button>
-                       <button onClick={() => setStrategyConfig({...strategyConfig, autoTarget: 'FOLLOW_LAST'})} className={`py-2 rounded-lg text-[10px] font-bold border ${strategyConfig.autoTarget === 'FOLLOW_LAST' ? 'bg-blue-500 text-white border-blue-500' : 'bg-white text-gray-400 border-gray-200'}`}>跟上期(顺)</button>
-                       <button onClick={() => setStrategyConfig({...strategyConfig, autoTarget: 'REVERSE_LAST'})} className={`py-2 rounded-lg text-[10px] font-bold border ${strategyConfig.autoTarget === 'REVERSE_LAST' ? 'bg-purple-500 text-white border-purple-500' : 'bg-white text-gray-400 border-gray-200'}`}>反上期(砍)</button>
-                    </div>
-                 </div>
-
-                 {(strategyConfig.autoTarget === 'FOLLOW_LAST' || strategyConfig.autoTarget === 'REVERSE_LAST') && (
-                    <div className="flex items-center justify-between bg-amber-50 px-3 py-2 rounded-xl border border-amber-100 animate-in fade-in">
-                       <div className="flex items-center space-x-2">
-                          <AlertTriangle className="w-3 h-3 text-amber-500" />
-                          <span className="text-[10px] font-bold text-amber-700">起投连数</span>
-                       </div>
-                       <input 
-                         type="number" min="1" 
-                         value={strategyConfig.minStreak} 
-                         onChange={e => setStrategyConfig({...strategyConfig, minStreak: Math.max(1, parseInt(e.target.value) || 1)})} 
-                         className="w-16 text-center bg-white rounded-lg text-xs font-black border border-amber-200 text-amber-600" 
-                       />
-                    </div>
-                 )}
-
-                 <div className="pt-4 border-t border-gray-100 mt-2">
-                    <div className="flex items-center justify-between mb-3">
-                       <span className="text-xs font-bold text-gray-500">基础注额</span>
-                       <input type="number" value={config.baseBet} onChange={(e) => setConfig({...config, baseBet: parseFloat(e.target.value)})} className="w-20 text-right bg-gray-50 px-2 py-1 rounded-lg text-xs font-black" />
-                    </div>
-                    <button 
-                      onClick={() => setIsAutoRunning(!isAutoRunning)}
-                      className={`w-full py-3.5 rounded-xl font-black text-sm flex items-center justify-center transition-all shadow-lg active:scale-95 ${
-                        isAutoRunning ? 'bg-red-50 text-red-600 border border-red-200 hover:bg-red-100' : 'bg-indigo-600 text-white hover:bg-indigo-700'
-                      }`}
-                    >
-                      {isAutoRunning ? <><StopCircle className="w-4 h-4 mr-2" /> 停止托管</> : <><PlayCircle className="w-4 h-4 mr-2" /> 启动托管</>}
-                    </button>
-                    {isAutoRunning && <p className="text-[10px] text-center text-indigo-400 font-bold mt-2 animate-pulse">策略运行中 - 正在监控区块...</p>}
-                 </div>
               </div>
            </div>
         </div>
 
-        {/* CENTER: MANUAL BETTING */}
-        <div className="lg:col-span-2 space-y-6">
-           <div className={`bg-white rounded-[2rem] p-8 shadow-xl border transition-colors relative ${isAutoRunning ? 'border-indigo-200 bg-indigo-50/10' : 'border-gray-100'}`}>
-              {isAutoRunning && (
-                 <div className="absolute inset-0 bg-white/60 backdrop-blur-[1px] z-10 flex items-center justify-center rounded-[2rem]">
-                    <div className="bg-white px-5 py-2.5 rounded-full shadow-xl border border-indigo-100 flex items-center text-indigo-600 font-black text-xs">
-                       <RefreshCw className="w-3.5 h-3.5 mr-2 animate-spin" /> 自动托管中，手动面板已锁定
-                    </div>
-                 </div>
-              )}
-              
+        {/* CENTER/RIGHT: TASKS & MANUAL (8 cols) */}
+        <div className="lg:col-span-8 space-y-6">
+           
+           {/* RUNNING TASKS GRID */}
+           {tasks.length > 0 && (
+             <div className="space-y-4">
+                <div className="flex justify-between items-center px-2">
+                   <div className="flex items-center space-x-2">
+                      <Activity className="w-5 h-5 text-indigo-600" />
+                      <h3 className="font-black text-gray-900">运行中的任务 ({tasks.filter(t => t.isActive).length}/{tasks.length})</h3>
+                   </div>
+                   <div className="flex space-x-2">
+                      <button 
+                        onClick={startAllTasks}
+                        className="flex items-center space-x-1 px-3 py-1.5 bg-green-50 text-green-600 rounded-lg text-[10px] font-black hover:bg-green-100 transition-colors"
+                      >
+                         <PlayCircle className="w-3.5 h-3.5" />
+                         <span>全部开始</span>
+                      </button>
+                      <button 
+                        onClick={stopAllTasks}
+                        className="flex items-center space-x-1 px-3 py-1.5 bg-red-50 text-red-600 rounded-lg text-[10px] font-black hover:bg-red-100 transition-colors"
+                      >
+                         <StopCircle className="w-3.5 h-3.5" />
+                         <span>全部停止</span>
+                      </button>
+                   </div>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                   {tasks.map(task => {
+                     const rule = rules.find(r => r.id === task.ruleId);
+                     return (
+                       <div key={task.id} className={`rounded-2xl p-5 border-2 transition-all relative overflow-hidden ${task.isActive ? 'bg-white border-indigo-500 shadow-md' : 'bg-gray-50 border-gray-200 grayscale-[0.5]'}`}>
+                          <div className="flex justify-between items-start mb-3">
+                             <div>
+                                <h4 className="font-black text-sm text-gray-900 truncate max-w-[150px]">{task.name}</h4>
+                                <div className="flex items-center space-x-2 mt-1">
+                                   <span className="text-[10px] bg-indigo-50 text-indigo-600 px-2 py-0.5 rounded font-bold">{rule?.label}</span>
+                                   <span className="text-[10px] bg-purple-50 text-purple-600 px-2 py-0.5 rounded font-bold">{STRATEGY_LABELS[task.config.type]}</span>
+                                </div>
+                             </div>
+                             <button onClick={() => toggleTask(task.id)} className={`p-2 rounded-full transition-colors ${task.isActive ? 'text-red-500 hover:bg-red-50' : 'text-green-500 hover:bg-green-50'}`}>
+                                {task.isActive ? <PauseCircle className="w-6 h-6" /> : <PlayCircle className="w-6 h-6" />}
+                             </button>
+                          </div>
+                          
+                          <div className="grid grid-cols-3 gap-2 mb-4 bg-gray-50/50 p-2 rounded-xl">
+                             <div className="text-center">
+                                <span className="block text-[9px] text-gray-400 uppercase font-black">当前下注</span>
+                                <span className="block text-sm font-black text-gray-800">${task.state.currentBetAmount}</span>
+                             </div>
+                             <div className="text-center border-l border-gray-200">
+                                <span className="block text-[9px] text-gray-400 uppercase font-black">连输</span>
+                                <span className="block text-sm font-black text-red-500">{task.state.consecutiveLosses}</span>
+                             </div>
+                             <div className="text-center border-l border-gray-200">
+                                <span className="block text-[9px] text-gray-400 uppercase font-black">盈亏</span>
+                                <span className={`block text-sm font-black ${task.stats.profit >= 0 ? 'text-green-500' : 'text-red-500'}`}>{task.stats.profit >= 0 ? '+' : ''}{task.stats.profit.toFixed(0)}</span>
+                             </div>
+                          </div>
+
+                          <div className="flex justify-between items-center text-[10px] font-bold text-gray-400">
+                             <span>W: {task.stats.wins} / L: {task.stats.losses}</span>
+                             <button onClick={() => deleteTask(task.id)} className="text-gray-300 hover:text-red-500 flex items-center"><Trash2 className="w-3 h-3 mr-1" /> 删除</button>
+                          </div>
+                       </div>
+                     );
+                   })}
+                </div>
+             </div>
+           )}
+
+           {/* MANUAL BETTING PANEL */}
+           <div className="bg-white rounded-[2rem] p-8 shadow-xl border border-gray-100">
               <div className="flex justify-between items-center mb-6">
-                 <h3 className="text-lg font-black text-gray-900 flex items-center">
-                    <Gamepad2 className="w-5 h-5 mr-2 text-amber-500" /> 手动下注
-                 </h3>
-                 <div className="text-xs font-bold text-gray-400 bg-gray-100 px-3 py-1 rounded-lg">
-                    {activeRule.label} 下期: #{allBlocks.length > 0 ? getNextTargetHeight(allBlocks[0].height, activeRule.value, activeRule.startBlock) : '---'}
+                 <div className="flex items-center space-x-3">
+                   <Gamepad2 className="w-6 h-6 text-amber-500" />
+                   <div>
+                     <h3 className="text-lg font-black text-gray-900">手动下注面板</h3>
+                     <p className="text-[10px] text-gray-400 font-bold">即时干预，独立于托管任务</p>
+                   </div>
+                 </div>
+                 <div className="flex items-center gap-2">
+                   <select 
+                      value={activeManualRuleId}
+                      onChange={e => setActiveManualRuleId(e.target.value)}
+                      className="bg-gray-50 border-none text-xs font-black rounded-lg px-2 py-1.5 outline-none cursor-pointer"
+                   >
+                      {rules.map(r => <option key={r.id} value={r.id}>{r.label}</option>)}
+                   </select>
+                   <div className="text-xs font-bold text-gray-400 bg-gray-100 px-3 py-1.5 rounded-lg">
+                      下期: #{allBlocks.length > 0 ? getNextTargetHeight(allBlocks[0].height, manualRule.value, manualRule.startBlock) : '---'}
+                   </div>
                  </div>
               </div>
 
               <div className="grid grid-cols-2 gap-4">
                  <div className="space-y-2">
                     <div className="flex gap-2">
-                       <button onClick={() => placeBet(getNextTargetHeight(allBlocks[0].height, activeRule.value, activeRule.startBlock), 'PARITY', 'ODD', config.baseBet, false, balance)} className="flex-1 py-3 bg-red-500 text-white rounded-xl font-black text-lg shadow-md hover:bg-red-600 active:scale-95 transition-all">单</button>
-                       <button onClick={() => placeBet(getNextTargetHeight(allBlocks[0].height, activeRule.value, activeRule.startBlock), 'PARITY', 'EVEN', config.baseBet, false, balance)} className="flex-1 py-3 bg-teal-500 text-white rounded-xl font-black text-lg shadow-md hover:bg-teal-600 active:scale-95 transition-all">双</button>
+                       <button onClick={() => placeBet(getNextTargetHeight(allBlocks[0].height, manualRule.value, manualRule.startBlock), 'PARITY', 'ODD', config.baseBet, 'MANUAL', manualRule)} className="flex-1 py-3 bg-red-500 text-white rounded-xl font-black text-lg shadow-md hover:bg-red-600 active:scale-95 transition-all">单</button>
+                       <button onClick={() => placeBet(getNextTargetHeight(allBlocks[0].height, manualRule.value, manualRule.startBlock), 'PARITY', 'EVEN', config.baseBet, 'MANUAL', manualRule)} className="flex-1 py-3 bg-teal-500 text-white rounded-xl font-black text-lg shadow-md hover:bg-teal-600 active:scale-95 transition-all">双</button>
                     </div>
                  </div>
                  <div className="space-y-2">
                     <div className="flex gap-2">
-                       <button onClick={() => placeBet(getNextTargetHeight(allBlocks[0].height, activeRule.value, activeRule.startBlock), 'SIZE', 'BIG', config.baseBet, false, balance)} className="flex-1 py-3 bg-orange-500 text-white rounded-xl font-black text-lg shadow-md hover:bg-orange-600 active:scale-95 transition-all">大</button>
-                       <button onClick={() => placeBet(getNextTargetHeight(allBlocks[0].height, activeRule.value, activeRule.startBlock), 'SIZE', 'SMALL', config.baseBet, false, balance)} className="flex-1 py-3 bg-indigo-500 text-white rounded-xl font-black text-lg shadow-md hover:bg-indigo-600 active:scale-95 transition-all">小</button>
+                       <button onClick={() => placeBet(getNextTargetHeight(allBlocks[0].height, manualRule.value, manualRule.startBlock), 'SIZE', 'BIG', config.baseBet, 'MANUAL', manualRule)} className="flex-1 py-3 bg-orange-500 text-white rounded-xl font-black text-lg shadow-md hover:bg-orange-600 active:scale-95 transition-all">大</button>
+                       <button onClick={() => placeBet(getNextTargetHeight(allBlocks[0].height, manualRule.value, manualRule.startBlock), 'SIZE', 'SMALL', config.baseBet, 'MANUAL', manualRule)} className="flex-1 py-3 bg-indigo-500 text-white rounded-xl font-black text-lg shadow-md hover:bg-indigo-600 active:scale-95 transition-all">小</button>
                     </div>
                  </div>
               </div>
@@ -726,6 +922,7 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
               </div>
            </div>
 
+           {/* PENDING BETS LIST */}
            {pendingBets.length > 0 && (
               <div className="space-y-3">
                  <div className="flex items-center space-x-2 text-xs font-black text-gray-400 uppercase px-2">
@@ -735,8 +932,8 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
                     <div key={bet.id} className="bg-white p-4 rounded-2xl border border-indigo-100 shadow-sm flex justify-between items-center relative overflow-hidden">
                        <div className="absolute left-0 top-0 bottom-0 w-1 bg-amber-400 animate-pulse"></div>
                        <div className="flex items-center space-x-3 pl-2">
-                          <span className={`text-[10px] px-2 py-0.5 rounded font-black ${bet.strategyLabel !== 'MANUAL' ? 'bg-purple-100 text-purple-600' : 'bg-gray-100 text-gray-500'}`}>
-                             {STRATEGY_LABELS[bet.strategyLabel || 'MANUAL'] || bet.strategyLabel}
+                          <span className={`text-[10px] px-2 py-0.5 rounded font-black ${bet.taskId ? 'bg-purple-100 text-purple-600' : 'bg-gray-100 text-gray-500'}`}>
+                             {bet.taskName || '手动'}
                           </span>
                           <div>
                              <span className="block text-xs font-black text-gray-800">#{bet.targetHeight}</span>
@@ -756,7 +953,7 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
         </div>
       </div>
 
-      {/* 3. HISTORY */}
+      {/* 3. HISTORY TABLE */}
       <div className="bg-white rounded-[2.5rem] p-6 shadow-xl border border-gray-100">
          <div className="flex items-center space-x-2 mb-4">
             <History className="w-5 h-5 text-gray-400" />
@@ -767,6 +964,7 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
                <thead className="text-[10px] font-black text-gray-400 uppercase tracking-wider border-b border-gray-100">
                   <tr>
                      <th className="pb-2 pl-2">区块</th>
+                     <th className="pb-2">来源</th>
                      <th className="pb-2">策略</th>
                      <th className="pb-2">下注</th>
                      <th className="pb-2">结果</th>
@@ -776,13 +974,18 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
                </thead>
                <tbody className="text-xs font-medium text-gray-600">
                   {settledBets.length === 0 ? (
-                     <tr><td colSpan={6} className="py-8 text-center text-gray-300 font-bold">暂无记录</td></tr>
+                     <tr><td colSpan={7} className="py-8 text-center text-gray-300 font-bold">暂无记录</td></tr>
                   ) : (
                      settledBets.slice(0, 30).map(bet => (
                         <tr key={bet.id} className="border-b border-gray-50 last:border-0 hover:bg-gray-50/50">
                            <td className="py-3 pl-2">
                               <span className="font-black text-gray-800 block">#{bet.targetHeight}</span>
                               <span className="text-[9px] text-gray-400">{bet.ruleName}</span>
+                           </td>
+                           <td className="py-3">
+                              <span className={`text-[9px] font-bold px-2 py-0.5 rounded ${bet.taskId ? 'bg-purple-50 text-purple-600' : 'bg-amber-50 text-amber-600'}`}>
+                                 {bet.taskName || '手动'}
+                              </span>
                            </td>
                            <td className="py-3">
                              <span className="text-[9px] bg-gray-100 px-1.5 py-0.5 rounded font-bold text-gray-500">

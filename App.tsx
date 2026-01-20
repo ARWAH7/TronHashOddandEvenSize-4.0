@@ -528,7 +528,13 @@ const App: React.FC = () => {
 
       {/* Main View Area */}
       <div className="mb-12">
-        {activeTab === 'dashboard' ? (
+        {/* NEW: Simulated Betting (Always mounted, hidden via CSS when inactive) */}
+        <div className={activeTab === 'simulated-betting' ? "animate-in fade-in slide-in-from-bottom-4 duration-500" : "hidden"}>
+             <SimulatedBetting allBlocks={allBlocks} rules={rules} />
+        </div>
+
+        {/* Dashboard */}
+        {activeTab === 'dashboard' && (
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-12 animate-in fade-in zoom-in-95 duration-500">
             {/* dashboard modules */}
             <div className="h-fit p-1 bg-slate-100 rounded-3xl shadow-inner border border-slate-200">
@@ -552,7 +558,10 @@ const App: React.FC = () => {
                 blocks={ruleFilteredBlocks} mode="size" rule={activeRule} title="大小珠盘" rows={activeRule?.beadRows || 6} />
             </div>
           </div>
-        ) : activeTab === 'dragon-list' ? (
+        )}
+
+        {/* Dragon List */}
+        {activeTab === 'dragon-list' && (
           <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
              <DragonList 
                 allBlocks={allBlocks} 
@@ -562,15 +571,17 @@ const App: React.FC = () => {
                 onJumpToChart={handleJumpToChart}
              />
           </div>
-        ) : activeTab === 'ai-prediction' ? (
+        )}
+        
+        {/* AI Prediction */}
+        {activeTab === 'ai-prediction' && (
           <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
              <AIPrediction allBlocks={allBlocks} rules={rules} />
           </div>
-        ) : activeTab === 'simulated-betting' ? (
-          <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
-             <SimulatedBetting allBlocks={allBlocks} rules={rules} />
-          </div>
-        ) : (
+        )}
+
+        {/* Generic Charts for Sub-tabs */}
+        {['parity-trend', 'size-trend', 'parity-bead', 'size-bead'].includes(activeTab) && (
           <div className="bg-white rounded-[2.5rem] p-6 md:p-10 shadow-xl border border-gray-100 mb-12 animate-in fade-in slide-in-from-bottom-4 duration-500 h-auto">
             <div className="flex items-center space-x-3 mb-8 px-2">
                <div className="p-2 bg-blue-50 rounded-xl">
