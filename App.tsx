@@ -573,12 +573,10 @@ const App: React.FC = () => {
           </div>
         )}
         
-        {/* AI Prediction */}
-        {activeTab === 'ai-prediction' && (
-          <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
+        {/* AI Prediction (Always mounted to ensure background calculation) */}
+        <div className={activeTab === 'ai-prediction' ? "animate-in fade-in slide-in-from-bottom-4 duration-500" : "hidden"}>
              <AIPrediction allBlocks={allBlocks} rules={rules} />
-          </div>
-        )}
+        </div>
 
         {/* Generic Charts for Sub-tabs */}
         {['parity-trend', 'size-trend', 'parity-bead', 'size-bead'].includes(activeTab) && (

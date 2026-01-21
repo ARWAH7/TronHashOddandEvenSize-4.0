@@ -5,7 +5,7 @@ import {
   Gamepad2, Wallet, TrendingUp, History, CheckCircle2, XCircle, 
   Trash2, Clock, Settings2, PlayCircle, StopCircle, RefreshCw, 
   ChevronDown, ChevronUp, AlertTriangle, Target, ArrowRight, Percent, BarChart4,
-  Plus, Layers, Activity, PauseCircle, Power
+  Plus, Layers, Activity, PauseCircle, Power, TrendingDown
 } from 'lucide-react';
 
 interface SimulatedBettingProps {
@@ -18,7 +18,7 @@ interface SimulatedBettingProps {
 type BetType = 'PARITY' | 'SIZE';
 type BetTarget = 'ODD' | 'EVEN' | 'BIG' | 'SMALL';
 type StrategyType = 'MANUAL' | 'MARTINGALE' | 'DALEMBERT' | 'FLAT' | 'FIBONACCI' | 'PAROLI' | '1326' | 'CUSTOM';
-type AutoTargetMode = 'FIXED_ODD' | 'FIXED_EVEN' | 'FIXED_BIG' | 'FIXED_SMALL' | 'FOLLOW_LAST' | 'REVERSE_LAST';
+type AutoTargetMode = 'FIXED_ODD' | 'FIXED_EVEN' | 'FIXED_BIG' | 'FIXED_SMALL' | 'FOLLOW_LAST' | 'REVERSE_LAST' | 'GLOBAL_TREND_DRAGON' | 'GLOBAL_BEAD_DRAGON';
 
 interface BetRecord {
   id: string;
@@ -78,6 +78,9 @@ interface AutoTask {
     wins: number;
     losses: number;
     profit: number;
+    maxProfit: number; // Highest profit reached
+    maxLoss: number;   // Lowest profit reached (Max Drawdown)
+    totalBetAmount: number; // Total volume wagered
   };
 }
 
@@ -104,6 +107,26 @@ const getNextTargetHeight = (currentHeight: number, step: number, startBlock: nu
   const nextMultiplier = Math.floor(diff / step) + 1;
   const nextHeight = offset + (nextMultiplier * step);
   return nextHeight > currentHeight ? nextHeight : nextHeight + step;
+};
+
+// Helper: Get blocks belonging to a specific Bead Road Row
+const getBeadRowBlocks = (blocks: BlockData[], rule: IntervalRule, rowIdx: number) => {
+    const epoch = rule.startBlock || 0;
+    const interval = rule.value;
+    const rows = rule.beadRows || 6;
+    
+    return blocks.filter(b => {
+        // Alignment check first
+        if(rule.value > 1) {
+            if(rule.startBlock > 0 && b.height < rule.startBlock) return false;
+            if(rule.startBlock > 0 && (b.height - rule.startBlock) % rule.value !== 0) return false;
+            if(rule.startBlock === 0 && b.height % rule.value !== 0) return false;
+        }
+        
+        const h = b.height;
+        const logicalIdx = Math.floor((h - epoch) / interval);
+        return (logicalIdx % rows) === rowIdx;
+    }).sort((a, b) => b.height - a.height);
 };
 
 // SVG Chart
@@ -178,7 +201,20 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
     if (typeof window === 'undefined') return [];
     try {
       const saved = localStorage.getItem('sim_v3_tasks');
-      return saved ? JSON.parse(saved) : [];
+      if (saved) {
+        // Migration support: ensure new fields exist
+        const parsed: AutoTask[] = JSON.parse(saved);
+        return parsed.map(t => ({
+          ...t,
+          stats: {
+            ...t.stats,
+            maxProfit: t.stats.maxProfit ?? 0,
+            maxLoss: t.stats.maxLoss ?? 0,
+            totalBetAmount: t.stats.totalBetAmount ?? 0
+          }
+        }));
+      }
+      return [];
     } catch { return []; }
   });
 
@@ -292,7 +328,14 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
         sequenceIndex: 0
       },
       isActive: false, // Default to paused
-      stats: { wins: 0, losses: 0, profit: 0 }
+      stats: { 
+        wins: 0, 
+        losses: 0, 
+        profit: 0,
+        maxProfit: 0,
+        maxLoss: 0,
+        totalBetAmount: 0
+      }
     };
     setTasks(prev => [...prev, newTask]);
     // Reset draft name
@@ -383,9 +426,17 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
               const task = nextTasks[taskIndex];
               
               // Update Stats
+              const sessionProfit = (isWin ? payout : 0) - bet.amount;
+              const newTotalProfit = task.stats.profit + sessionProfit;
+
               task.stats.wins += isWin ? 1 : 0;
               task.stats.losses += isWin ? 0 : 1;
-              task.stats.profit += (isWin ? payout : 0) - bet.amount;
+              task.stats.profit = newTotalProfit;
+              
+              // Update Max/Min Records & Total Bet
+              task.stats.maxProfit = Math.max(task.stats.maxProfit, newTotalProfit);
+              task.stats.maxLoss = Math.min(task.stats.maxLoss, newTotalProfit);
+              task.stats.totalBetAmount = (task.stats.totalBetAmount || 0) + bet.amount;
 
               // Update Strategy State (Martingale, etc.)
               let { currentBetAmount, consecutiveLosses, sequenceIndex } = task.state;
@@ -499,6 +550,95 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
           return;
         }
 
+        // GLOBAL TASKS: Scan all rules
+        if (task.config.autoTarget.startsWith('GLOBAL')) {
+            // Check if this task already has a pending bet (Strict sequential betting)
+            const hasPending = finalBets.some(b => b.taskId === task.id && b.status === 'PENDING');
+            if (hasPending) return;
+
+            let bestCandidate = { streak: 0, rule: null as IntervalRule | null, type: 'PARITY' as BetType, target: 'ODD' as BetTarget, height: 0, desc: '' };
+
+            rules.forEach(rule => {
+                if (task.config.autoTarget === 'GLOBAL_TREND_DRAGON') {
+                    const ruleBlocks = allBlocks.filter(b => checkRuleAlignment(b.height, rule));
+                    if (ruleBlocks.length === 0) return;
+                    
+                    const nextH = getNextTargetHeight(allBlocks[0].height, rule.value, rule.startBlock);
+                    
+                    // Check if we already bet on this specific opportunity in this cycle (avoid dupe if multiple tasks target same)
+                    // (Optional, but good practice)
+                    
+                    // Parity
+                    const pStreak = calculateStreak(ruleBlocks, 'PARITY');
+                    if (pStreak.count > bestCandidate.streak) {
+                        bestCandidate = { streak: pStreak.count, rule, type: 'PARITY', target: pStreak.val as BetTarget, height: nextH, desc: `(走势${pStreak.count}连)` };
+                    }
+                    // Size
+                    const sStreak = calculateStreak(ruleBlocks, 'SIZE');
+                    if (sStreak.count > bestCandidate.streak) {
+                        bestCandidate = { streak: sStreak.count, rule, type: 'SIZE', target: sStreak.val as BetTarget, height: nextH, desc: `(走势${sStreak.count}连)` };
+                    }
+
+                } else if (task.config.autoTarget === 'GLOBAL_BEAD_DRAGON') {
+                    const rows = rule.beadRows || 6;
+                    for(let r=0; r<rows; r++) {
+                         const rowBlocks = getBeadRowBlocks(allBlocks, rule, r);
+                         if (rowBlocks.length === 0) continue;
+                         
+                         // Check Parity
+                         const pStreak = calculateStreak(rowBlocks, 'PARITY');
+                         if (pStreak.count > bestCandidate.streak) {
+                             const lastH = rowBlocks[0].height;
+                             const nextH = lastH + (rule.value * rows); // Physics of bead road
+                             if (nextH > allBlocks[0].height) {
+                                 bestCandidate = { streak: pStreak.count, rule, type: 'PARITY', target: pStreak.val as BetTarget, height: nextH, desc: `(珠盘R${r+1} ${pStreak.count}连)` };
+                             }
+                         }
+                         // Check Size
+                         const sStreak = calculateStreak(rowBlocks, 'SIZE');
+                         if (sStreak.count > bestCandidate.streak) {
+                             const lastH = rowBlocks[0].height;
+                             const nextH = lastH + (rule.value * rows);
+                             if (nextH > allBlocks[0].height) {
+                                 bestCandidate = { streak: sStreak.count, rule, type: 'SIZE', target: sStreak.val as BetTarget, height: nextH, desc: `(珠盘R${r+1} ${sStreak.count}连)` };
+                             }
+                         }
+                    }
+                }
+            });
+
+            // If we found a candidate satisfying min streak
+            if (bestCandidate.streak >= task.config.minStreak && bestCandidate.rule) {
+                // Double check if we already have this exact bet in finalBets (from other tasks or previous cycle logic)
+                const isDupe = finalBets.some(b => b.targetHeight === bestCandidate.height && b.ruleId === bestCandidate.rule!.id && b.taskId === task.id);
+                if (!isDupe) {
+                     const amount = Math.floor(task.state.currentBetAmount);
+                     const newBet: BetRecord = {
+                         id: Date.now().toString() + Math.random().toString().slice(2, 6) + task.id,
+                         taskId: task.id,
+                         taskName: `${task.name} ${bestCandidate.desc}`,
+                         timestamp: Date.now(),
+                         ruleId: bestCandidate.rule.id,
+                         ruleName: bestCandidate.rule.label,
+                         targetHeight: bestCandidate.height,
+                         betType: bestCandidate.type,
+                         prediction: bestCandidate.target,
+                         amount,
+                         odds: config.odds,
+                         status: 'PENDING',
+                         payout: 0,
+                         strategyLabel: task.config.type,
+                         balanceAfter: 0
+                     };
+                     currentBalance -= amount;
+                     finalBets.unshift(newBet);
+                     betsChanged = true;
+                }
+            }
+            return; // End of Global Task Logic for this task
+        }
+
+        // STANDARD TASKS (Single Rule)
         const rule = rules.find(r => r.id === task.ruleId);
         if (!rule) return;
 
@@ -652,19 +792,27 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
                       />
                    </div>
 
-                   {/* Rule Selector */}
-                   <div className="bg-indigo-50/50 p-4 rounded-2xl border border-indigo-100/50">
-                      <label className="text-[10px] font-black text-gray-400 uppercase block mb-2">下注规则 (秒数)</label>
-                      <select 
-                        value={draftRuleId} 
-                        onChange={e => setDraftRuleId(e.target.value)}
-                        className="w-full bg-white text-indigo-900 rounded-xl px-3 py-2 text-xs font-black border border-indigo-100 outline-none cursor-pointer shadow-sm"
-                      >
-                         {rules.map(r => (
-                           <option key={r.id} value={r.id}>{r.label} (步长: {r.value})</option>
-                         ))}
-                      </select>
-                   </div>
+                   {/* Rule Selector (Hidden for Global Modes) */}
+                   {!draftConfig.autoTarget.startsWith('GLOBAL') && (
+                     <div className="bg-indigo-50/50 p-4 rounded-2xl border border-indigo-100/50">
+                        <label className="text-[10px] font-black text-gray-400 uppercase block mb-2">下注规则 (秒数)</label>
+                        <select 
+                          value={draftRuleId} 
+                          onChange={e => setDraftRuleId(e.target.value)}
+                          className="w-full bg-white text-indigo-900 rounded-xl px-3 py-2 text-xs font-black border border-indigo-100 outline-none cursor-pointer shadow-sm"
+                        >
+                           {rules.map(r => (
+                             <option key={r.id} value={r.id}>{r.label} (步长: {r.value})</option>
+                           ))}
+                        </select>
+                     </div>
+                   )}
+                   {draftConfig.autoTarget.startsWith('GLOBAL') && (
+                      <div className="bg-amber-50/50 p-4 rounded-2xl border border-amber-100/50 flex items-center space-x-2">
+                          <Activity className="w-5 h-5 text-amber-500 animate-pulse" />
+                          <span className="text-xs font-black text-amber-700">全域扫描模式已激活：自动匹配所有规则</span>
+                      </div>
+                   )}
 
                    {/* Strategy Type */}
                    <div>
@@ -699,7 +847,6 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
                          <input type="number" value={draftConfig.step} onChange={e => setDraftConfig({...draftConfig, step: parseFloat(e.target.value)})} className="w-20 bg-white rounded-lg px-2 py-1 text-xs font-black text-center" />
                       </div>
                    )}
-                   {/* Custom Sequence Input */}
                    {draftConfig.type === 'CUSTOM' && (
                       <div className="bg-gray-50 px-3 py-2 rounded-xl">
                         <span className="text-[10px] font-bold text-gray-400 block mb-1">自定义倍数序列 (逗号分隔)</span>
@@ -720,7 +867,11 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
                    {/* Target Mode */}
                    <div>
                       <label className="text-[10px] font-black text-gray-400 uppercase ml-1">自动目标</label>
-                      <div className="grid grid-cols-2 gap-2 mt-1">
+                      <div className="grid grid-cols-2 gap-2 mt-1 mb-2">
+                         <button onClick={() => setDraftConfig({...draftConfig, autoTarget: 'GLOBAL_TREND_DRAGON'})} className={`py-2 rounded-lg text-[10px] font-bold border ${draftConfig.autoTarget === 'GLOBAL_TREND_DRAGON' ? 'bg-amber-500 text-white border-amber-500' : 'bg-white text-gray-400 border-gray-200'}`}>全域走势长龙</button>
+                         <button onClick={() => setDraftConfig({...draftConfig, autoTarget: 'GLOBAL_BEAD_DRAGON'})} className={`py-2 rounded-lg text-[10px] font-bold border ${draftConfig.autoTarget === 'GLOBAL_BEAD_DRAGON' ? 'bg-amber-500 text-white border-amber-500' : 'bg-white text-gray-400 border-gray-200'}`}>全域珠盘长龙</button>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2">
                          <button onClick={() => setDraftConfig({...draftConfig, autoTarget: 'FIXED_ODD'})} className={`py-2 rounded-lg text-[10px] font-bold border ${draftConfig.autoTarget === 'FIXED_ODD' ? 'bg-red-500 text-white border-red-500' : 'bg-white text-gray-400 border-gray-200'}`}>定买单</button>
                          <button onClick={() => setDraftConfig({...draftConfig, autoTarget: 'FIXED_EVEN'})} className={`py-2 rounded-lg text-[10px] font-bold border ${draftConfig.autoTarget === 'FIXED_EVEN' ? 'bg-teal-500 text-white border-teal-500' : 'bg-white text-gray-400 border-gray-200'}`}>定买双</button>
                          <button onClick={() => setDraftConfig({...draftConfig, autoTarget: 'FIXED_BIG'})} className={`py-2 rounded-lg text-[10px] font-bold border ${draftConfig.autoTarget === 'FIXED_BIG' ? 'bg-orange-500 text-white border-orange-500' : 'bg-white text-gray-400 border-gray-200'}`}>定买大</button>
@@ -730,22 +881,24 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
                       </div>
                    </div>
 
-                   {(draftConfig.autoTarget === 'FOLLOW_LAST' || draftConfig.autoTarget === 'REVERSE_LAST') && (
+                   {(draftConfig.autoTarget === 'FOLLOW_LAST' || draftConfig.autoTarget === 'REVERSE_LAST' || draftConfig.autoTarget.startsWith('GLOBAL')) && (
                       <div className="bg-gray-50 p-3 rounded-xl border border-gray-100">
-                          <div className="flex gap-2 mb-3">
-                             <button 
-                                  onClick={() => setDraftConfig({...draftConfig, targetType: 'PARITY'})}
-                                  className={`flex-1 py-1.5 rounded-lg text-[10px] font-bold border ${draftConfig.targetType === 'PARITY' ? 'bg-white shadow text-indigo-600 border-indigo-200' : 'text-gray-400 border-transparent'}`}
-                             >
-                                  玩法：单双
-                             </button>
-                             <button 
-                                  onClick={() => setDraftConfig({...draftConfig, targetType: 'SIZE'})}
-                                  className={`flex-1 py-1.5 rounded-lg text-[10px] font-bold border ${draftConfig.targetType === 'SIZE' ? 'bg-white shadow text-indigo-600 border-indigo-200' : 'text-gray-400 border-transparent'}`}
-                             >
-                                  玩法：大小
-                             </button>
-                          </div>
+                          { !draftConfig.autoTarget.startsWith('GLOBAL') && (
+                              <div className="flex gap-2 mb-3">
+                                 <button 
+                                      onClick={() => setDraftConfig({...draftConfig, targetType: 'PARITY'})}
+                                      className={`flex-1 py-1.5 rounded-lg text-[10px] font-bold border ${draftConfig.targetType === 'PARITY' ? 'bg-white shadow text-indigo-600 border-indigo-200' : 'text-gray-400 border-transparent'}`}
+                                 >
+                                      玩法：单双
+                                 </button>
+                                 <button 
+                                      onClick={() => setDraftConfig({...draftConfig, targetType: 'SIZE'})}
+                                      className={`flex-1 py-1.5 rounded-lg text-[10px] font-bold border ${draftConfig.targetType === 'SIZE' ? 'bg-white shadow text-indigo-600 border-indigo-200' : 'text-gray-400 border-transparent'}`}
+                                 >
+                                      玩法：大小
+                                 </button>
+                              </div>
+                          )}
                           <div className="flex items-center justify-between">
                               <span className="text-[10px] font-bold text-amber-600 flex items-center"><AlertTriangle className="w-3 h-3 mr-1" /> 起投连数</span>
                               <input 
@@ -842,7 +995,9 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
                              <div>
                                 <h4 className="font-black text-sm text-gray-900 truncate max-w-[150px]">{task.name}</h4>
                                 <div className="flex items-center space-x-2 mt-1">
-                                   <span className="text-[10px] bg-indigo-50 text-indigo-600 px-2 py-0.5 rounded font-bold">{rule?.label}</span>
+                                   <span className={`text-[10px] px-2 py-0.5 rounded font-bold ${task.config.autoTarget.startsWith('GLOBAL') ? 'bg-amber-100 text-amber-600' : 'bg-indigo-50 text-indigo-600'}`}>
+                                      {task.config.autoTarget.startsWith('GLOBAL') ? '全域扫描' : rule?.label}
+                                   </span>
                                    <span className="text-[10px] bg-purple-50 text-purple-600 px-2 py-0.5 rounded font-bold">{STRATEGY_LABELS[task.config.type]}</span>
                                 </div>
                              </div>
@@ -851,7 +1006,7 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
                              </button>
                           </div>
                           
-                          <div className="grid grid-cols-3 gap-2 mb-4 bg-gray-50/50 p-2 rounded-xl">
+                          <div className="grid grid-cols-3 gap-2 mb-2 bg-gray-50/50 p-2 rounded-xl">
                              <div className="text-center">
                                 <span className="block text-[9px] text-gray-400 uppercase font-black">当前下注</span>
                                 <span className="block text-sm font-black text-gray-800">${task.state.currentBetAmount}</span>
@@ -863,6 +1018,30 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
                              <div className="text-center border-l border-gray-200">
                                 <span className="block text-[9px] text-gray-400 uppercase font-black">盈亏</span>
                                 <span className={`block text-sm font-black ${task.stats.profit >= 0 ? 'text-green-500' : 'text-red-500'}`}>{task.stats.profit >= 0 ? '+' : ''}{task.stats.profit.toFixed(0)}</span>
+                             </div>
+                          </div>
+                          
+                          <div className="grid grid-cols-3 gap-2 mb-4 bg-gray-50/50 p-2 rounded-xl">
+                             <div className="text-center flex items-center justify-center space-x-1">
+                                <TrendingUp className="w-3 h-3 text-green-500" />
+                                <div>
+                                    <span className="block text-[9px] text-gray-400 uppercase font-black">最高收益</span>
+                                    <span className="block text-xs font-black text-green-600">+{task.stats.maxProfit.toFixed(0)}</span>
+                                </div>
+                             </div>
+                             <div className="text-center border-l border-gray-200 flex items-center justify-center space-x-1">
+                                <TrendingDown className="w-3 h-3 text-red-500" />
+                                <div>
+                                    <span className="block text-[9px] text-gray-400 uppercase font-black">最大亏损</span>
+                                    <span className="block text-xs font-black text-red-600">{task.stats.maxLoss.toFixed(0)}</span>
+                                </div>
+                             </div>
+                             <div className="text-center border-l border-gray-200 flex items-center justify-center space-x-1">
+                                <Wallet className="w-3 h-3 text-blue-500" />
+                                <div>
+                                    <span className="block text-[9px] text-gray-400 uppercase font-black">累计下注</span>
+                                    <span className="block text-xs font-black text-blue-600">${(task.stats.totalBetAmount || 0).toLocaleString()}</span>
+                                </div>
                              </div>
                           </div>
 
