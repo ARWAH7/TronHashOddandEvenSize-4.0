@@ -157,6 +157,32 @@ const runDeepAnalysisV4 = (blocks: BlockData[], rule: IntervalRule, targetHeight
     modelS = "贝叶斯后验推理";
   }
 
+  // ------------------------------------------------------------------
+  // 核心优化：强制互斥逻辑 (Single Best Result Enforcement)
+  // ------------------------------------------------------------------
+  // 只能推送最稳的一个结果，不能同时推两个
+  if (confP > confS) {
+      nextS = 'NEUTRAL';
+      confS = 0;
+      modelS = "未激活";
+  } else if (confS > confP) {
+      nextP = 'NEUTRAL';
+      confP = 0;
+      modelP = "未激活";
+  } else {
+      // 只有当两者置信度完全相等时
+      if (confP >= 92) {
+          // 如果都达到高置信度且相等，优先推单双 (约定)，丢弃大小
+          nextS = 'NEUTRAL';
+          confS = 0;
+          modelS = "未激活";
+      } else {
+          // 均未达到优势阈值，全部重置
+          nextP = 'NEUTRAL'; confP = 0; modelP = "未激活";
+          nextS = 'NEUTRAL'; confS = 0; modelS = "未激活";
+      }
+  }
+
   const entropy = Math.round(Math.random() * 20 + 10);
   const shouldPredict = (confP >= 92 || confS >= 92) && entropy < 40;
 
@@ -166,8 +192,8 @@ const runDeepAnalysisV4 = (blocks: BlockData[], rule: IntervalRule, targetHeight
     parityConfidence: Math.min(99, Math.round(confP)),
     nextSize: nextS,
     sizeConfidence: Math.min(99, Math.round(confS)),
-    analysis: `稳定模型 [${modelP}/${modelS}] 探测到 [${rule.label}] 的哈希流呈显著共振。`,
-    detectedCycle: modelP !== "随机分布" ? modelP : modelS,
+    analysis: `稳定模型 [${modelP !== "未激活" ? modelP : modelS}] 探测到 [${rule.label}] 的哈希流呈显著共振。`,
+    detectedCycle: modelP !== "未激活" ? modelP : modelS,
     riskLevel: entropy < 25 ? 'LOW' : 'MEDIUM',
     entropyScore: entropy,
     targetHeight,
