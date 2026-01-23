@@ -6,7 +6,7 @@ import {
   Trash2, Clock, Settings2, PlayCircle, StopCircle, RefreshCw, 
   ChevronDown, ChevronUp, AlertTriangle, Target, ArrowRight, Percent, BarChart4,
   Plus, Layers, Activity, PauseCircle, Power, TrendingDown, BrainCircuit, ShieldAlert,
-  ZoomIn, X, Maximize2, MoveHorizontal, Sparkles, Scale, Trophy
+  ZoomIn, X, Maximize2, MoveHorizontal, Sparkles, Scale, Trophy, Shuffle, BarChart2
 } from 'lucide-react';
 
 interface SimulatedBettingProps {
@@ -19,7 +19,7 @@ interface SimulatedBettingProps {
 type BetType = 'PARITY' | 'SIZE';
 type BetTarget = 'ODD' | 'EVEN' | 'BIG' | 'SMALL';
 type StrategyType = 'MANUAL' | 'MARTINGALE' | 'DALEMBERT' | 'FLAT' | 'FIBONACCI' | 'PAROLI' | '1326' | 'CUSTOM' | 'AI_KELLY';
-type AutoTargetMode = 'FIXED_ODD' | 'FIXED_EVEN' | 'FIXED_BIG' | 'FIXED_SMALL' | 'FOLLOW_LAST' | 'REVERSE_LAST' | 'GLOBAL_TREND_DRAGON' | 'GLOBAL_BEAD_DRAGON' | 'AI_PREDICTION' | 'GLOBAL_AI_FULL_SCAN';
+type AutoTargetMode = 'FIXED_ODD' | 'FIXED_EVEN' | 'FIXED_BIG' | 'FIXED_SMALL' | 'FOLLOW_LAST' | 'REVERSE_LAST' | 'GLOBAL_TREND_DRAGON' | 'GLOBAL_BEAD_DRAGON' | 'AI_PREDICTION' | 'GLOBAL_AI_FULL_SCAN' | 'RANDOM_PARITY' | 'RANDOM_SIZE' | 'FOLLOW_RECENT_TREND' | 'FOLLOW_RECENT_TREND_REVERSE';
 
 interface BetRecord {
   id: string;
@@ -58,6 +58,7 @@ interface StrategyConfig {
   minStreak: number;
   customSequence?: number[]; // Added for Custom Strategy
   kellyFraction?: number; // 0.1 to 1.0
+  trendWindow?: number; // Added for FOLLOW_RECENT_TREND (e.g. 5, 6, 4)
 }
 
 interface StrategyState {
@@ -602,6 +603,10 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
             totalBetAmount: t.stats.totalBetAmount ?? 0,
             peakProfit: t.stats.peakProfit ?? Math.max(0, t.stats.profit),
             maxDrawdown: t.stats.maxDrawdown ?? 0
+          },
+          config: {
+            ...t.config,
+            trendWindow: t.config.trendWindow || 5 // Migration for new property
           }
         }));
       }
@@ -621,7 +626,8 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
       step: 10,
       minStreak: 1,
       customSequence: [1, 2, 4, 8, 17], // Default custom sequence
-      kellyFraction: 0.2 // Default 20%
+      kellyFraction: 0.2, // Default 20%
+      trendWindow: 5
   });
   const [customSeqText, setCustomSeqText] = useState('1, 2, 4, 8, 17');
 
@@ -686,6 +692,34 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
     }
     return { val: firstVal, count };
   }, []);
+
+  // Helper to generate task badge
+  const getTaskBadgeContent = (task: AutoTask, rule?: IntervalRule) => {
+    if (task.config.autoTarget === 'GLOBAL_AI_FULL_SCAN') return { text: 'AI 全域全规则', color: 'bg-indigo-100 text-indigo-600' };
+    if (task.config.autoTarget.startsWith('GLOBAL')) return { text: '全域扫描', color: 'bg-amber-100 text-amber-600' };
+    if (task.config.autoTarget === 'AI_PREDICTION') return { text: 'AI 单规托管', color: 'bg-purple-100 text-purple-600' };
+    
+    // Standard
+    const ruleLabel = rule?.label || '未知规则';
+    let detail = '';
+    const typeStr = task.config.targetType === 'PARITY' ? '单双' : '大小';
+    
+    switch(task.config.autoTarget) {
+        case 'FIXED_ODD': detail = '定投单'; break;
+        case 'FIXED_EVEN': detail = '定投双'; break;
+        case 'FIXED_BIG': detail = '定投大'; break;
+        case 'FIXED_SMALL': detail = '定投小'; break;
+        case 'FOLLOW_LAST': detail = `跟上期 (${typeStr})`; break;
+        case 'REVERSE_LAST': detail = `反上期 (${typeStr})`; break;
+        case 'RANDOM_PARITY': detail = '随机单双'; break;
+        case 'RANDOM_SIZE': detail = '随机大小'; break;
+        case 'FOLLOW_RECENT_TREND': detail = `顺势N=${task.config.trendWindow || 5} (仿前${task.config.trendWindow || 5}期)`; break;
+        case 'FOLLOW_RECENT_TREND_REVERSE': detail = `反势N=${task.config.trendWindow || 5} (反前${task.config.trendWindow || 5}期)`; break;
+        default: detail = '自定义';
+    }
+    
+    return { text: `${ruleLabel} · ${detail}`, color: 'bg-slate-100 text-slate-600' };
+  };
 
   // --- CORE ACTIONS ---
 
@@ -1235,6 +1269,34 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
           const t = task.config.autoTarget.split('_')[1] as BetTarget;
           target = t;
           type = (t === 'ODD' || t === 'EVEN') ? 'PARITY' : 'SIZE';
+        } else if (task.config.autoTarget === 'RANDOM_PARITY') {
+          shouldBet = true;
+          type = 'PARITY';
+          target = Math.random() < 0.5 ? 'ODD' : 'EVEN';
+        } else if (task.config.autoTarget === 'RANDOM_SIZE') {
+          shouldBet = true;
+          type = 'SIZE';
+          target = Math.random() < 0.5 ? 'BIG' : 'SMALL';
+        } else if (task.config.autoTarget === 'FOLLOW_RECENT_TREND' || task.config.autoTarget === 'FOLLOW_RECENT_TREND_REVERSE') {
+          // MODIFIED LOGIC: Copy result from N periods ago (Lag Strategy)
+          // Example: Target = 42, N = 3, Source = 39. (42 - 3*1 = 39)
+          const n = task.config.trendWindow || 5;
+          const sourceHeight = nextHeight - (n * rule.value);
+          const sourceBlock = allBlocks.find(b => b.height === sourceHeight);
+          
+          if (sourceBlock) {
+             shouldBet = true;
+             type = task.config.targetType || 'PARITY';
+             const isReverse = task.config.autoTarget === 'FOLLOW_RECENT_TREND_REVERSE';
+
+             if (type === 'PARITY') {
+                 if (isReverse) target = sourceBlock.type === 'ODD' ? 'EVEN' : 'ODD';
+                 else target = sourceBlock.type;
+             } else {
+                 if (isReverse) target = sourceBlock.sizeType === 'BIG' ? 'SMALL' : 'BIG';
+                 else target = sourceBlock.sizeType;
+             }
+          }
         } else if (ruleBlocks.length > 0) {
            const targetType = task.config.targetType || 'PARITY';
            const streak = calculateStreak(ruleBlocks, targetType);
@@ -1561,10 +1623,14 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
                          <button onClick={() => setDraftConfig({...draftConfig, autoTarget: 'FIXED_SMALL'})} className={`py-2 rounded-lg text-[10px] font-bold border ${draftConfig.autoTarget === 'FIXED_SMALL' ? 'bg-indigo-500 text-white border-indigo-500' : 'bg-white text-gray-400 border-gray-200'}`}>定买小</button>
                          <button onClick={() => setDraftConfig({...draftConfig, autoTarget: 'FOLLOW_LAST'})} className={`py-2 rounded-lg text-[10px] font-bold border ${draftConfig.autoTarget === 'FOLLOW_LAST' ? 'bg-blue-500 text-white border-blue-500' : 'bg-white text-gray-400 border-gray-200'}`}>跟上期(顺)</button>
                          <button onClick={() => setDraftConfig({...draftConfig, autoTarget: 'REVERSE_LAST'})} className={`py-2 rounded-lg text-[10px] font-bold border ${draftConfig.autoTarget === 'REVERSE_LAST' ? 'bg-purple-500 text-white border-purple-500' : 'bg-white text-gray-400 border-gray-200'}`}>反上期(砍)</button>
+                         <button onClick={() => setDraftConfig({...draftConfig, autoTarget: 'RANDOM_PARITY'})} className={`py-2 rounded-lg text-[10px] font-bold border ${draftConfig.autoTarget === 'RANDOM_PARITY' ? 'bg-pink-500 text-white border-pink-500' : 'bg-white text-gray-400 border-gray-200'}`}>随机单双</button>
+                         <button onClick={() => setDraftConfig({...draftConfig, autoTarget: 'RANDOM_SIZE'})} className={`py-2 rounded-lg text-[10px] font-bold border ${draftConfig.autoTarget === 'RANDOM_SIZE' ? 'bg-cyan-500 text-white border-cyan-500' : 'bg-white text-gray-400 border-gray-200'}`}>随机大小</button>
+                         <button onClick={() => setDraftConfig({...draftConfig, autoTarget: 'FOLLOW_RECENT_TREND'})} className={`py-2 rounded-lg text-[10px] font-bold border ${draftConfig.autoTarget === 'FOLLOW_RECENT_TREND' ? 'bg-lime-600 text-white border-lime-600' : 'bg-white text-gray-400 border-gray-200'}`}>参考近期走势 (顺势)</button>
+                         <button onClick={() => setDraftConfig({...draftConfig, autoTarget: 'FOLLOW_RECENT_TREND_REVERSE'})} className={`py-2 rounded-lg text-[10px] font-bold border ${draftConfig.autoTarget === 'FOLLOW_RECENT_TREND_REVERSE' ? 'bg-rose-600 text-white border-rose-600' : 'bg-white text-gray-400 border-gray-200'}`}>参考近期走势 (反势)</button>
                       </div>
                    </div>
 
-                   {(draftConfig.autoTarget === 'FOLLOW_LAST' || draftConfig.autoTarget === 'REVERSE_LAST' || draftConfig.autoTarget.startsWith('GLOBAL')) && (
+                   {(draftConfig.autoTarget === 'FOLLOW_LAST' || draftConfig.autoTarget === 'REVERSE_LAST' || draftConfig.autoTarget === 'FOLLOW_RECENT_TREND' || draftConfig.autoTarget === 'FOLLOW_RECENT_TREND_REVERSE' || draftConfig.autoTarget.startsWith('GLOBAL')) && (
                       <div className="bg-gray-50 p-3 rounded-xl border border-gray-100">
                           { !draftConfig.autoTarget.startsWith('GLOBAL') && (
                               <div className="flex gap-2 mb-3">
@@ -1582,15 +1648,30 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
                                  </button>
                               </div>
                           )}
-                          <div className="flex items-center justify-between">
-                              <span className="text-[10px] font-bold text-amber-600 flex items-center"><AlertTriangle className="w-3 h-3 mr-1" /> 起投连数</span>
-                              <input 
-                                  type="number" min="1" 
-                                  value={draftConfig.minStreak} 
-                                  onChange={e => setDraftConfig({...draftConfig, minStreak: Math.max(1, parseInt(e.target.value) || 1)})} 
-                                  className="w-16 text-center bg-white rounded-lg text-xs font-black border border-amber-200 text-amber-600" 
-                              />
-                          </div>
+                          
+                          {(draftConfig.autoTarget === 'FOLLOW_RECENT_TREND' || draftConfig.autoTarget === 'FOLLOW_RECENT_TREND_REVERSE') ? (
+                             <div className="flex items-center justify-between">
+                                <span className={`text-[10px] font-bold flex items-center ${draftConfig.autoTarget === 'FOLLOW_RECENT_TREND_REVERSE' ? 'text-rose-600' : 'text-lime-600'}`}>
+                                    <BarChart2 className="w-3 h-3 mr-1" /> 参考期数 (N)
+                                </span>
+                                <input 
+                                    type="number" min="2" 
+                                    value={draftConfig.trendWindow} 
+                                    onChange={e => setDraftConfig({...draftConfig, trendWindow: Math.max(2, parseInt(e.target.value) || 5)})} 
+                                    className={`w-16 text-center bg-white rounded-lg text-xs font-black border ${draftConfig.autoTarget === 'FOLLOW_RECENT_TREND_REVERSE' ? 'border-rose-200 text-rose-600' : 'border-lime-200 text-lime-600'}`} 
+                                />
+                             </div>
+                          ) : (
+                             <div className="flex items-center justify-between">
+                                <span className="text-[10px] font-bold text-amber-600 flex items-center"><AlertTriangle className="w-3 h-3 mr-1" /> 起投连数</span>
+                                <input 
+                                    type="number" min="1" 
+                                    value={draftConfig.minStreak} 
+                                    onChange={e => setDraftConfig({...draftConfig, minStreak: Math.max(1, parseInt(e.target.value) || 1)})} 
+                                    className="w-16 text-center bg-white rounded-lg text-xs font-black border border-amber-200 text-amber-600" 
+                                />
+                             </div>
+                          )}
                       </div>
                    )}
 
@@ -1685,14 +1766,44 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
                    {tasks.map(task => {
                      const rule = rules.find(r => r.id === task.ruleId);
                      const taskDDRate = config.initialBalance > 0 ? (task.stats.maxDrawdown / config.initialBalance) * 100 : 0;
+                     
+                     // Helper to generate task badge
+                     const getTaskBadgeContent = (t: AutoTask, r?: IntervalRule) => {
+                        if (t.config.autoTarget === 'GLOBAL_AI_FULL_SCAN') return { text: 'AI 全域全规则', color: 'bg-indigo-100 text-indigo-600' };
+                        if (t.config.autoTarget.startsWith('GLOBAL')) return { text: '全域扫描', color: 'bg-amber-100 text-amber-600' };
+                        if (t.config.autoTarget === 'AI_PREDICTION') return { text: 'AI 单规托管', color: 'bg-purple-100 text-purple-600' };
+                        
+                        const ruleLabel = r?.label || '未知规则';
+                        let detail = '';
+                        const typeStr = t.config.targetType === 'PARITY' ? '单双' : '大小';
+                        
+                        switch(t.config.autoTarget) {
+                            case 'FIXED_ODD': detail = '定投单'; break;
+                            case 'FIXED_EVEN': detail = '定投双'; break;
+                            case 'FIXED_BIG': detail = '定投大'; break;
+                            case 'FIXED_SMALL': detail = '定投小'; break;
+                            case 'FOLLOW_LAST': detail = `跟上期 (${typeStr})`; break;
+                            case 'REVERSE_LAST': detail = `反上期 (${typeStr})`; break;
+                            case 'RANDOM_PARITY': detail = '随机单双'; break;
+                            case 'RANDOM_SIZE': detail = '随机大小'; break;
+                            case 'FOLLOW_RECENT_TREND': detail = `顺势N=${t.config.trendWindow || 5} (仿前${t.config.trendWindow || 5}期)`; break;
+                            case 'FOLLOW_RECENT_TREND_REVERSE': detail = `反势N=${t.config.trendWindow || 5} (反前${t.config.trendWindow || 5}期)`; break;
+                            default: detail = '自定义';
+                        }
+                        
+                        return { text: `${ruleLabel} · ${detail}`, color: 'bg-slate-100 text-slate-600' };
+                     };
+
+                     const badge = getTaskBadgeContent(task, rule);
+
                      return (
                        <div key={task.id} className={`rounded-2xl p-5 border-2 transition-all relative overflow-hidden ${task.isActive ? 'bg-white border-indigo-500 shadow-md' : 'bg-gray-50 border-gray-200 grayscale-[0.5]'}`}>
                           <div className="flex justify-between items-start mb-3">
                              <div>
                                 <h4 className="font-black text-sm text-gray-900 truncate max-w-[150px]">{task.name}</h4>
                                 <div className="flex items-center space-x-2 mt-1">
-                                   <span className={`text-[10px] px-2 py-0.5 rounded font-bold ${task.config.autoTarget.startsWith('GLOBAL') ? 'bg-amber-100 text-amber-600' : (task.config.autoTarget === 'AI_PREDICTION' ? 'bg-purple-100 text-purple-600' : 'bg-indigo-50 text-indigo-600')}`}>
-                                      {task.config.autoTarget.startsWith('GLOBAL') ? (task.config.autoTarget === 'GLOBAL_AI_FULL_SCAN' ? 'AI 全域全规则' : '全域扫描') : (task.config.autoTarget === 'AI_PREDICTION' ? 'AI托管' : rule?.label)}
+                                   <span className={`text-[10px] px-2 py-0.5 rounded font-bold ${badge.color}`}>
+                                      {badge.text}
                                    </span>
                                    <span className="text-[10px] bg-purple-50 text-purple-600 px-2 py-0.5 rounded font-bold">{STRATEGY_LABELS[task.config.type]}</span>
                                 </div>
@@ -1757,52 +1868,60 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
              </div>
            )}
 
-           {/* MANUAL BETTING PANEL */}
-           <div className="bg-white rounded-[2rem] p-8 shadow-xl border border-gray-100">
+           {/* MANUAL BETTING CARD */}
+           <div className="bg-white rounded-[2rem] p-6 shadow-sm border border-gray-100">
               <div className="flex justify-between items-center mb-6">
-                 <div className="flex items-center space-x-3">
-                   <Gamepad2 className="w-6 h-6 text-amber-500" />
-                   <div>
-                     <h3 className="text-lg font-black text-gray-900">手动下注面板</h3>
-                     <p className="text-[10px] text-gray-400 font-bold">即时干预，独立于托管任务</p>
-                   </div>
+                 <div className="flex items-center space-x-2">
+                    <Gamepad2 className="w-5 h-5 text-indigo-600" />
+                    <h3 className="font-black text-gray-900">手动极速下注</h3>
                  </div>
-                 <div className="flex items-center gap-2">
-                   <select 
-                      value={activeManualRuleId}
-                      onChange={e => setActiveManualRuleId(e.target.value)}
-                      className="bg-gray-50 border-none text-xs font-black rounded-lg px-2 py-1.5 outline-none cursor-pointer"
-                   >
-                      {rules.map(r => <option key={r.id} value={r.id}>{r.label}</option>)}
-                   </select>
-                   <div className="text-xs font-bold text-gray-400 bg-gray-100 px-3 py-1.5 rounded-lg">
-                      下期: #{allBlocks.length > 0 ? getNextTargetHeight(allBlocks[0].height, manualRule.value, manualRule.startBlock) : '---'}
-                   </div>
-                 </div>
+                 <select 
+                    value={activeManualRuleId} 
+                    onChange={e => setActiveManualRuleId(e.target.value)}
+                    className="bg-gray-50 text-gray-600 rounded-xl px-3 py-1.5 text-xs font-black border border-gray-100 outline-none"
+                 >
+                    {rules.map(r => (
+                      <option key={r.id} value={r.id}>{r.label}</option>
+                    ))}
+                 </select>
               </div>
-
-              <div className="grid grid-cols-2 gap-4">
-                 <div className="space-y-2">
-                    <div className="flex gap-2">
-                       <button onClick={() => placeBet(getNextTargetHeight(allBlocks[0].height, manualRule.value, manualRule.startBlock), 'PARITY', 'ODD', config.baseBet, 'MANUAL', manualRule)} className="flex-1 py-3 bg-red-500 text-white rounded-xl font-black text-lg shadow-md hover:bg-red-600 active:scale-95 transition-all">单</button>
-                       <button onClick={() => placeBet(getNextTargetHeight(allBlocks[0].height, manualRule.value, manualRule.startBlock), 'PARITY', 'EVEN', config.baseBet, 'MANUAL', manualRule)} className="flex-1 py-3 bg-teal-500 text-white rounded-xl font-black text-lg shadow-md hover:bg-teal-600 active:scale-95 transition-all">双</button>
-                    </div>
-                 </div>
-                 <div className="space-y-2">
-                    <div className="flex gap-2">
-                       <button onClick={() => placeBet(getNextTargetHeight(allBlocks[0].height, manualRule.value, manualRule.startBlock), 'SIZE', 'BIG', config.baseBet, 'MANUAL', manualRule)} className="flex-1 py-3 bg-orange-500 text-white rounded-xl font-black text-lg shadow-md hover:bg-orange-600 active:scale-95 transition-all">大</button>
-                       <button onClick={() => placeBet(getNextTargetHeight(allBlocks[0].height, manualRule.value, manualRule.startBlock), 'SIZE', 'SMALL', config.baseBet, 'MANUAL', manualRule)} className="flex-1 py-3 bg-indigo-500 text-white rounded-xl font-black text-lg shadow-md hover:bg-indigo-600 active:scale-95 transition-all">小</button>
-                    </div>
-                 </div>
+              
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                 <button 
+                   onClick={() => manualRule && placeBet(getNextTargetHeight(allBlocks[0].height, manualRule.value, manualRule.startBlock), 'PARITY', 'ODD', config.baseBet, 'MANUAL', manualRule)}
+                   className="py-4 bg-red-500 hover:bg-red-600 text-white rounded-xl font-black text-sm shadow-lg shadow-red-200 active:scale-95 transition-all flex flex-col items-center justify-center"
+                 >
+                    <span className="text-lg">单 (ODD)</span>
+                    <span className="text-[10px] opacity-80">1:{config.odds}</span>
+                 </button>
+                 <button 
+                   onClick={() => manualRule && placeBet(getNextTargetHeight(allBlocks[0].height, manualRule.value, manualRule.startBlock), 'PARITY', 'EVEN', config.baseBet, 'MANUAL', manualRule)}
+                   className="py-4 bg-teal-500 hover:bg-teal-600 text-white rounded-xl font-black text-sm shadow-lg shadow-teal-200 active:scale-95 transition-all flex flex-col items-center justify-center"
+                 >
+                    <span className="text-lg">双 (EVEN)</span>
+                    <span className="text-[10px] opacity-80">1:{config.odds}</span>
+                 </button>
+                 <button 
+                   onClick={() => manualRule && placeBet(getNextTargetHeight(allBlocks[0].height, manualRule.value, manualRule.startBlock), 'SIZE', 'BIG', config.baseBet, 'MANUAL', manualRule)}
+                   className="py-4 bg-orange-500 hover:bg-orange-600 text-white rounded-xl font-black text-sm shadow-lg shadow-orange-200 active:scale-95 transition-all flex flex-col items-center justify-center"
+                 >
+                    <span className="text-lg">大 (BIG)</span>
+                    <span className="text-[10px] opacity-80">1:{config.odds}</span>
+                 </button>
+                 <button 
+                   onClick={() => manualRule && placeBet(getNextTargetHeight(allBlocks[0].height, manualRule.value, manualRule.startBlock), 'SIZE', 'SMALL', config.baseBet, 'MANUAL', manualRule)}
+                   className="py-4 bg-indigo-500 hover:bg-indigo-600 text-white rounded-xl font-black text-sm shadow-lg shadow-indigo-200 active:scale-95 transition-all flex flex-col items-center justify-center"
+                 >
+                    <span className="text-lg">小 (SMALL)</span>
+                    <span className="text-[10px] opacity-80">1:{config.odds}</span>
+                 </button>
               </div>
-              <div className="flex justify-center gap-2 mt-5">
-                 {[10, 50, 100, 500, 1000].map(amt => (
-                    <button key={amt} onClick={() => setConfig({...config, baseBet: amt})} className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${config.baseBet === amt ? 'bg-gray-800 text-white' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`}>{amt}</button>
-                 ))}
-              </div>
+              <p className="text-[10px] text-gray-400 font-bold mt-4 text-center">
+                 当前选中规则: {manualRule?.label} (步长: {manualRule?.value}) · 下注金额: ${config.baseBet}
+              </p>
            </div>
 
-           {/* PENDING BETS LIST */}
+           {/* PENDING BETS LIST (RESTORED) */}
            {pendingBets.length > 0 && (
               <div className="space-y-3">
                  <div className="flex items-center space-x-2 text-xs font-black text-gray-400 uppercase px-2">
@@ -1833,11 +1952,11 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
         </div>
       </div>
 
-      {/* 3. HISTORY TABLE */}
+      {/* 3. HISTORY TABLE (RESTORED TO BOTTOM) */}
       <div className="bg-white rounded-[2.5rem] p-6 shadow-xl border border-gray-100">
          <div className="flex items-center space-x-2 mb-4">
             <History className="w-5 h-5 text-gray-400" />
-            <h3 className="text-base font-black text-gray-900">历史记录</h3>
+            <h3 className="text-base font-black text-gray-900">历史记录 (已结算)</h3>
          </div>
          <div className="overflow-x-auto">
             <table className="w-full text-left">
