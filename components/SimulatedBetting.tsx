@@ -6,7 +6,7 @@ import {
   Trash2, Clock, Settings2, PlayCircle, StopCircle, RefreshCw, 
   ChevronDown, ChevronUp, AlertTriangle, Target, ArrowRight, Percent, BarChart4,
   Plus, Layers, Activity, PauseCircle, Power, TrendingDown, BrainCircuit, ShieldAlert,
-  ZoomIn, X, Maximize2, MoveHorizontal, Sparkles, Scale
+  ZoomIn, X, Maximize2, MoveHorizontal, Sparkles, Scale, Trophy
 } from 'lucide-react';
 
 interface SimulatedBettingProps {
@@ -563,7 +563,7 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
   const [config, setConfig] = useState<SimConfig>(() => {
     const defaults = {
       initialBalance: 10000,
-      odds: 1.98,
+      odds: 1.96, // CHANGED: Default odds 1.96
       stopLoss: 0,
       takeProfit: 0,
       baseBet: 100
@@ -787,7 +787,7 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
     // Defaults
     const defaults = {
       initialBalance: 10000,
-      odds: 1.98,
+      odds: 1.96, // CHANGED: Default odds 1.96
       stopLoss: 0,
       takeProfit: 0,
       baseBet: 100
@@ -1326,7 +1326,17 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
     const profit = balance - config.initialBalance;
     const profitPercent = (profit / config.initialBalance) * 100;
     const ddRate = globalMetrics.peakBalance > 0 ? (globalMetrics.maxDrawdown / globalMetrics.peakBalance) * 100 : 0;
-    return { wins, total, winRate, profit, profitPercent, ddRate, maxDrawdown: globalMetrics.maxDrawdown };
+
+    // Max Profit Calculation (Highest Balance - Initial Principal)
+    const maxProfitVal = globalMetrics.peakBalance - config.initialBalance;
+    const maxProfitPercent = config.initialBalance > 0 ? (maxProfitVal / config.initialBalance) * 100 : 0;
+
+    return { 
+        wins, total, winRate, profit, profitPercent, ddRate, 
+        maxDrawdown: globalMetrics.maxDrawdown,
+        maxProfit: maxProfitVal,
+        maxProfitPercent
+    };
   }, [settledBets, balance, config.initialBalance, globalMetrics]);
 
   return (
@@ -1342,9 +1352,24 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
                <TrendingUp className={`w-3 h-3 mr-1 ${stats.profit < 0 ? 'rotate-180' : ''}`} />
                {stats.profit >= 0 ? '+' : ''}{stats.profit.toFixed(2)} ({stats.profitPercent > 0 ? '+' : ''}{stats.profitPercent.toFixed(2)}%)
             </div>
-            <div className="mt-2 text-[10px] font-black text-red-500 flex items-center border-t border-gray-50 pt-2">
-               <ShieldAlert className="w-3 h-3 mr-1" />
-               最大回撤: -${stats.maxDrawdown.toFixed(0)} (-{stats.ddRate.toFixed(1)}%)
+            
+            <div className="mt-3 pt-3 border-t border-gray-50 grid grid-cols-2 gap-2">
+                <div className="text-[10px] font-black text-green-600 flex flex-col">
+                   <span className="text-gray-400 uppercase tracking-wider mb-0.5 flex items-center">
+                      <Trophy className="w-3 h-3 mr-1" /> 最高收益
+                   </span>
+                   <span>
+                      {stats.maxProfit >= 0 ? '+' : ''}{stats.maxProfit.toFixed(0)} ({stats.maxProfitPercent > 0 ? '+' : ''}{stats.maxProfitPercent.toFixed(1)}%)
+                   </span>
+                </div>
+                <div className="text-[10px] font-black text-red-500 flex flex-col text-right">
+                   <span className="text-gray-400 uppercase tracking-wider mb-0.5 flex items-center justify-end">
+                      <ShieldAlert className="w-3 h-3 mr-1" /> 最大回撤
+                   </span>
+                   <span>
+                      -${stats.maxDrawdown.toFixed(0)} (-{stats.ddRate.toFixed(1)}%)
+                   </span>
+                </div>
             </div>
          </div>
          <div className="bg-white rounded-3xl p-6 shadow-sm border border-gray-100">
@@ -1591,7 +1616,19 @@ const SimulatedBetting: React.FC<SimulatedBettingProps> = ({ allBlocks, rules })
               <div className="grid grid-cols-2 gap-3">
                    <div>
                      <label className="text-[10px] font-black text-gray-400 uppercase">初始本金</label>
-                     <input type="number" value={config.initialBalance} onChange={e => setConfig({...config, initialBalance: parseFloat(e.target.value)})} className="w-full bg-gray-50 rounded-lg px-2 py-1.5 text-xs font-bold border border-transparent focus:border-indigo-500 outline-none" />
+                     <input 
+                       type="number" 
+                       value={config.initialBalance} 
+                       onChange={e => {
+                         const val = parseFloat(e.target.value);
+                         setConfig({...config, initialBalance: val});
+                         if (!isNaN(val)) {
+                           setBalance(val);
+                           setGlobalMetrics({ peakBalance: val, maxDrawdown: 0 });
+                         }
+                       }} 
+                       className="w-full bg-gray-50 rounded-lg px-2 py-1.5 text-xs font-bold border border-transparent focus:border-indigo-500 outline-none" 
+                     />
                    </div>
                    <div>
                      <label className="text-[10px] font-black text-gray-400 uppercase">赔率</label>
